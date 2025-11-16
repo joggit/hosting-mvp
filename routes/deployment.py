@@ -17,39 +17,33 @@ def register_routes(app):
     
     @app.route('/api/deploy/nodejs', methods=['POST'])
     def deploy_nodejs():
-        """
-        Deploy a Node.js/Next.js application
-        Supports: simple deployments, subdomain, root domain, SSL
-        
-        Request JSON:
-        {
-            "name": "app-name",
-            "files": {
-                "package.json": "...",
-                "pages/index.js": "...",
-                ...
-            },
-            "deployConfig": {
-                "port": 3000,  // optional
-                "env": {}      // optional environment variables
-            },
-            "domain_config": {  // optional
-                "subdomain": "app",
-                "parent_domain": "example.com",
-                // OR
-                "root_domain": "example.com",
-                "ssl_enabled": false,
-                "ssl_email": "admin@example.com"
-            }
-        }
-        """
+        """Deploy a Node.js/Next.js application"""
         try:
-            data = request.get_json()
+            # Better JSON parsing with error handling
+            if not request.is_json:
+                return jsonify({
+                    "success": False,
+                    "error": "Content-Type must be application/json"
+                }), 400
+            
+            try:
+                data = request.get_json(force=True)
+            except Exception as json_error:
+                return jsonify({
+                    "success": False,
+                    "error": f"Invalid JSON: {str(json_error)}"
+                }), 400
+            
+            if not data:
+                return jsonify({
+                    "success": False,
+                    "error": "Request body is empty"
+                }), 400
             
             # ═══════════════════════════════════════════════════════════
             # STEP 1: Validate required fields
             # ═══════════════════════════════════════════════════════════
-            if not data or 'name' not in data or 'files' not in data:
+            if 'name' not in data or 'files' not in data:
                 return jsonify({
                     "success": False,
                     "error": "Missing required fields: name and files"
@@ -63,6 +57,7 @@ def register_routes(app):
             app.logger.info(f"═══════════════════════════════════════")
             app.logger.info(f"🚀 Starting deployment for {site_name}")
             app.logger.info(f"Has domain_config: {domain_config is not None}")
+            app.logger.info(f"Files count: {len(project_files)}")
             app.logger.info(f"═══════════════════════════════════════")
             
             # Validate app name
@@ -247,29 +242,12 @@ module.exports = nextConfig;"""
                 if pm2_check.returncode == 0:
                     app.logger.info("Starting with PM2...")
                     
-                    # Create PM2 ecosystem file
-                    ecosystem = {
-                        "apps": [{
-                            "name": site_name,
-                            "cwd": app_dir,
-                            "script": "npm",
-                            "args": "start",
-                            "env": {
-                                "PORT": str(allocated_port),
-                                "NODE_ENV": "production",
-                                **deploy_config.get('env', {})
-                            }
-                        }]
-                    }
-                    
-                    ecosystem_path = os.path.join(app_dir, 'ecosystem.config.json')
-                    with open(ecosystem_path, 'w') as f:
-                        json.dump(ecosystem, f, indent=2)
-                    
                     # Start with PM2
                     subprocess.run([
-                        'pm2', 'start', ecosystem_path
-                    ], cwd=app_dir, capture_output=True)
+                        'pm2', 'start', 'npm', '--name', site_name,
+                        '--', 'start'
+                    ], cwd=app_dir, capture_output=True, 
+                    env={**os.environ, 'PORT': str(allocated_port)})
                     
                     process_manager = 'pm2'
                     app.logger.info(f"✅ Started with PM2")
