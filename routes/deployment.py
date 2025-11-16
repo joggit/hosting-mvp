@@ -60,12 +60,19 @@ def register_routes(app):
             app.logger.info(f"Files count: {len(project_files)}")
             app.logger.info(f"═══════════════════════════════════════")
             
-            # Validate app name
-            if not site_name.replace('-', '').replace('_', '').isalnum():
-                return jsonify({
-                    "success": False,
-                    "error": "Invalid app name. Use only letters, numbers, hyphens, and underscores"
-                }), 400
+            # Validate app name (allow dots for domain names)
+app.logger.info(f"Validating site name: '{site_name}'")
+
+# More lenient validation - allow dots, hyphens, underscores for domains
+cleaned_name = site_name.replace('-', '').replace('_', '').replace('.', '')
+if not cleaned_name.isalnum():
+    app.logger.error(f"Site name validation failed: '{site_name}'")
+    return jsonify({
+        "success": False,
+        "error": f"Invalid site name '{site_name}'. Use only letters, numbers, hyphens, underscores, and dots"
+    }), 400
+
+app.logger.info(f"✅ Site name validation passed: '{site_name}'")
             
             # ═══════════════════════════════════════════════════════════
             # STEP 2: Process domain configuration
