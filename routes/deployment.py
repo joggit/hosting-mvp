@@ -116,6 +116,9 @@ def register_routes(app):
 
                 # Check if domain already exists
                 if full_domain:
+                    app.logger.info(
+                        f"Checking if domain {full_domain} exists in database..."
+                    )
                     conn = get_db()
                     cursor = conn.cursor()
                     cursor.execute(
@@ -125,16 +128,14 @@ def register_routes(app):
                     exists = cursor.fetchone()[0] > 0
                     conn.close()
 
+                    app.logger.info(f"Domain exists check: {exists}")
+
                     if exists:
-                        return (
-                            jsonify(
-                                {
-                                    "success": False,
-                                    "error": f"Domain {full_domain} already exists",
-                                }
-                            ),
-                            400,
-                        )
+                        error_msg = f"Domain {full_domain} already exists. Please delete it first or use a different name."
+                        app.logger.error(f"❌ {error_msg}")
+                        return jsonify({"success": False, "error": error_msg}), 400
+
+                    app.logger.info(f"✅ Domain {full_domain} is available")
 
             # ═══════════════════════════════════════════════════════════
             # STEP 3: Fix package.json for Next.js + PM2 compatibility
