@@ -287,70 +287,75 @@ module.exports = nextConfig;"""
                 except:
                     pass
 
-        # ═══════════════════════════════════════════════════════════
-        # STEP 7: Start the application (PM2 or simple process)
-        # ═══════════════════════════════════════════════════════════
-        process_manager = 'simple'
+            # ═══════════════════════════════════════════════════════════
+            # STEP 7: Start the application (PM2 or simple process)
+            # ═══════════════════════════════════════════════════════════
+            process_manager = "simple"
 
-        try:
-            # Check for PM2 using full path
-            pm2_path = shutil.which('pm2') or '/usr/bin/pm2'
-            pm2_exists = os.path.exists(pm2_path)
-            
-            if pm2_exists:
-                app.logger.info(f"Starting with PM2 at {pm2_path}...")
-                
-                # Create PM2 ecosystem file for better control
-                ecosystem = {
-                    "apps": [{
-                        "name": site_name,
-                        "cwd": app_dir,
-                        "script": "npm",
-                        "args": "start",
-                        "env": {
-                            "PORT": str(allocated_port),
-                            "NODE_ENV": "production"
-                        },
-                        "instances": 1,
-                        "autorestart": True,
-                        "watch": False,
-                        "max_memory_restart": "1G"
-                    }]
-                }
-                
-                ecosystem_path = os.path.join(app_dir, 'ecosystem.config.json')
-                with open(ecosystem_path, 'w') as f:
-                    json.dump(ecosystem, f, indent=2)
-                
-                # Start with PM2
-                pm2_result = subprocess.run([
-                    pm2_path, 'start', ecosystem_path
-                ], capture_output=True, text=True)
-                
-                if pm2_result.returncode == 0:
-                    process_manager = 'pm2'
-                    app.logger.info(f"✅ Started with PM2")
-                    
-                    # Save PM2 process list
-                    subprocess.run([pm2_path, 'save'], capture_output=True)
+            try:
+                # Check for PM2 using full path
+                pm2_path = shutil.which("pm2") or "/usr/bin/pm2"
+                pm2_exists = os.path.exists(pm2_path)
+
+                if pm2_exists:
+                    app.logger.info(f"Starting with PM2 at {pm2_path}...")
+
+                    # Create PM2 ecosystem file for better control
+                    ecosystem = {
+                        "apps": [
+                            {
+                                "name": site_name,
+                                "cwd": app_dir,
+                                "script": "npm",
+                                "args": "start",
+                                "env": {
+                                    "PORT": str(allocated_port),
+                                    "NODE_ENV": "production",
+                                },
+                                "instances": 1,
+                                "autorestart": True,
+                                "watch": False,
+                                "max_memory_restart": "1G",
+                            }
+                        ]
+                    }
+
+                    ecosystem_path = os.path.join(app_dir, "ecosystem.config.json")
+                    with open(ecosystem_path, "w") as f:
+                        json.dump(ecosystem, f, indent=2)
+
+                    # Start with PM2
+                    pm2_result = subprocess.run(
+                        [pm2_path, "start", ecosystem_path],
+                        capture_output=True,
+                        text=True,
+                    )
+
+                    if pm2_result.returncode == 0:
+                        process_manager = "pm2"
+                        app.logger.info(f"✅ Started with PM2")
+
+                        # Save PM2 process list
+                        subprocess.run([pm2_path, "save"], capture_output=True)
+                    else:
+                        app.logger.warning(f"PM2 start failed: {pm2_result.stderr}")
+                        raise Exception("PM2 failed")
                 else:
-                    app.logger.warning(f"PM2 start failed: {pm2_result.stderr}")
-                    # Fall through to simple process
-                    raise Exception("PM2 failed")
-            else:
-                raise Exception("PM2 not found")
-                
-        except Exception as e:
-            # Fallback to simple background process
-            app.logger.info(f"Starting as background process (PM2 not available: {e})")
-            subprocess.Popen(
-                ['npm', 'start'],
-                cwd=app_dir,
-                env={**os.environ, 'PORT': str(allocated_port)},
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            app.logger.info("✅ Started as background process")
+                    raise Exception("PM2 not found")
+
+            except Exception as e:
+                # Fallback to simple background process
+                app.logger.info(
+                    f"Starting as background process (PM2 not available: {e})"
+                )
+                subprocess.Popen(
+                    ["npm", "start"],
+                    cwd=app_dir,
+                    env={**os.environ, "PORT": str(allocated_port)},
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                app.logger.info("✅ Started as background process")
 
             # ═══════════════════════════════════════════════════════════
             # STEP 8: Create nginx configuration (if domain provided)
