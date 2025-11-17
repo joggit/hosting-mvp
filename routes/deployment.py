@@ -141,6 +141,7 @@ def register_routes(app):
             # STEP 3: Fix package.json for Next.js + PM2 compatibility
             # ═══════════════════════════════════════════════════════════
             if "package.json" in project_files:
+                app.logger.info("Processing package.json...")
                 try:
                     package_data = json.loads(project_files["package.json"])
                     fixes_applied = []
@@ -211,17 +212,14 @@ module.exports = nextConfig;"""
             # STEP 5: Create app directory and write files
             # ═══════════════════════════════════════════════════════════
             app_dir = f"{CONFIG['web_root']}/{site_name}"
+            app.logger.info(f"Checking if app directory exists: {app_dir}")
 
             if os.path.exists(app_dir):
-                return (
-                    jsonify(
-                        {
-                            "success": False,
-                            "error": f"Application '{site_name}' already exists",
-                        }
-                    ),
-                    400,
+                error_msg = (
+                    f"Application directory '{site_name}' already exists at {app_dir}"
                 )
+                app.logger.error(f"❌ {error_msg}")
+                return jsonify({"success": False, "error": error_msg}), 400
 
             app.logger.info(f"Creating app directory: {app_dir}")
             os.makedirs(app_dir, exist_ok=True)
