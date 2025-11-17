@@ -237,54 +237,82 @@ module.exports = nextConfig;"""
             # ═══════════════════════════════════════════════════════════
             # STEP 6: Install dependencies
             # ═══════════════════════════════════════════════════════════
-            if "package.json" in project_files:
-                app.logger.info("Running npm install...")
+            # In routes/deployment.py, replace the npm install section:
 
-                result = subprocess.run(
-                    ["npm", "install"],
-                    cwd=app_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=300,
+            if "package.json" in project_files:
+                app.logger.info(
+                    "Running npm install (this may take several minutes)..."
                 )
 
-                if result.returncode != 0:
-                    app.logger.error(f"npm install failed: {result.stderr}")
+                try:
+                    # Use pnpm if available, fallback to npm
+                    pkg_manager = "pnpm" if shutil.which("pnpm") else "npm"
+                    app.logger.info(f"Using package manager: {pkg_manager}")
+
+                    result = subprocess.run(
+                        [pkg_manager, "install"],
+                        cwd=app_dir,
+                        capture_output=True,
+                        text=True,
+                        timeout=900,  # 15 minutes
+                    )
+
+                    if result.returncode != 0:
+                        app.logger.error(f"npm install failed: {result.stderr}")
+                        shutil.rmtree(app_dir)
+                        return (
+                            jsonify(
+                                {
+                                    "success": False,
+                                    "error": "npm install failed",
+                                    "details": result.stderr,
+                                }
+                            ),
+                            500,
+                        )
+
+                    app.logger.info("✅ npm install completed")
+
+                    # Run build if build script exists
+                    try:
+                        package_data = json.loads(
+                            project_files.get("package.json", "{}")
+                        )
+                        if "build" in package_data.get("scripts", {}):
+                            app.logger.info(
+                                "Running npm build (this may take several minutes)..."
+                            )
+                            build_result = subprocess.run(
+                                [pkg_manager, "run", "build"],
+                                cwd=app_dir,
+                                capture_output=True,
+                                text=True,
+                                timeout=900,  # 15 minutes
+                            )
+
+                            if build_result.returncode == 0:
+                                app.logger.info("✅ Build completed")
+                            else:
+                                app.logger.warning(f"Build completed with warnings")
+                    except subprocess.TimeoutExpired:
+                        app.logger.warning("Build timed out, but continuing...")
+                    except Exception as build_error:
+                        app.logger.warning(
+                            f"Build error (continuing anyway): {build_error}"
+                        )
+
+                except subprocess.TimeoutExpired:
+                    app.logger.error("npm install timed out after 15 minutes")
                     shutil.rmtree(app_dir)
                     return (
                         jsonify(
                             {
                                 "success": False,
-                                "error": "npm install failed",
-                                "details": result.stderr,
+                                "error": "npm install timed out. The application may have too many dependencies.",
                             }
                         ),
                         500,
                     )
-
-                app.logger.info("✅ npm install completed")
-
-                # Run build if build script exists
-                try:
-                    package_data = json.loads(project_files.get("package.json", "{}"))
-                    if "build" in package_data.get("scripts", {}):
-                        app.logger.info("Running npm build...")
-                        build_result = subprocess.run(
-                            ["npm", "run", "build"],
-                            cwd=app_dir,
-                            capture_output=True,
-                            text=True,
-                            timeout=300,
-                        )
-
-                        if build_result.returncode == 0:
-                            app.logger.info("✅ Build completed")
-                        else:
-                            app.logger.warning(
-                                f"Build had warnings: {build_result.stderr}"
-                            )
-                except:
-                    pass
 
             # ═══════════════════════════════════════════════════════════
             # STEP 7: Start the application (PM2 or simple process)
