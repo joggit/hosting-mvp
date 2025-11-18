@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Hosting Manager - Fresh Server Installation
-Single-session approach for reliable installation
+Fixed user creation and SSH key setup
 """
 
 import argparse
@@ -36,16 +36,35 @@ def print_header(message):
     print(f"{Colors.BLUE}{'='*60}{Colors.NC}\n")
 
 class FreshInstaller:
-    """Handles fresh server installation in a single SSH session"""
+    """Handles fresh server installation with proper user setup"""
     
     def __init__(self, server, username, repo_url, root_password=None):
         self.server = server
         self.username = username
         self.repo_url = repo_url
         self.root_password = root_password
+        
+        # Get local SSH public key
+        self.ssh_public_key = self.get_ssh_public_key()
+    
+    def get_ssh_public_key(self):
+        """Get the local SSH public key"""
+        ssh_key_path = Path.home() / '.ssh' / 'id_ed25519.pub'
+        if not ssh_key_path.exists():
+            ssh_key_path = Path.home() / '.ssh' / 'id_rsa.pub'
+        
+        if not ssh_key_path.exists():
+            print_warning("No SSH key found. Generating new key...")
+            subprocess.run("ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519", shell=True, check=True)
+            ssh_key_path = Path.home() / '.ssh' / 'id_ed25519.pub'
+        
+        return ssh_key_path.read_text().strip()
     
     def build_installation_script(self):
-        """Build the complete installation script"""
+        """Build the complete installation script with proper user setup"""
+        # Escape single quotes in SSH key for shell
+        ssh_key_escaped = self.ssh_public_key.replace("'", "'\"'\"'")
+        
         return f"""
 set -e  # Exit on any error
 
@@ -64,30 +83,67 @@ apt-get install -y curl wget git vim ufw fail2ban
 echo "✅ System updated"
 
 # ═══════════════════════════════════════════════════════════
-# STEP 2: Create User
+# STEP 2: Create User (PROPERLY)
 # ═══════════════════════════════════════════════════════════
 echo "[2/10] Setting up user {self.username}..."
+
+# Check if user exists
 if id "{self.username}" &>/dev/null; then
     echo "User {self.username} already exists"
+    # Ensure home directory exists
+    if [ ! -d "/home/{self.username}" ]; then
+        echo "Creating home directory..."
+        mkhomedir_helper {self.username}
+    fi
 else
-    adduser --disabled-password --gecos '' {self.username}
+    # Create user with home directory
+    echo "Creating user {self.username}..."
+    useradd -m -s /bin/bash {self.username}
+    echo "User created with home directory"
 fi
 
 # Ensure sudo access
 usermod -aG sudo {self.username}
 echo '{self.username} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/{self.username}
 chmod 440 /etc/sudoers.d/{self.username}
+
+# Verify user and home directory
+if [ ! -d "/home/{self.username}" ]; then
+    echo "ERROR: Home directory was not created!"
+    exit 1
+fi
+
+echo "User info:"
+id {self.username}
+ls -la /home/{self.username}
 echo "✅ User {self.username} ready"
 
 # ═══════════════════════════════════════════════════════════
-# STEP 3: Setup SSH Keys
+# STEP 3: Setup SSH Keys (PROPERLY)
 # ═══════════════════════════════════════════════════════════
 echo "[3/10] Setting up SSH keys..."
+
+# Create .ssh directory
 mkdir -p /home/{self.username}/.ssh
-cat /root/.ssh/authorized_keys > /home/{self.username}/.ssh/authorized_keys 2>/dev/null || echo "No root keys to copy"
 chmod 700 /home/{self.username}/.ssh
-chmod 600 /home/{self.username}/.ssh/authorized_keys 2>/dev/null || true
+
+# Add YOUR SSH public key (from local machine)
+echo '{ssh_key_escaped}' > /home/{self.username}/.ssh/authorized_keys
+
+# Also copy root's keys if they exist (for backwards compatibility)
+if [ -f /root/.ssh/authorized_keys ]; then
+    cat /root/.ssh/authorized_keys >> /home/{self.username}/.ssh/authorized_keys
+fi
+
+# Set proper permissions
+chmod 600 /home/{self.username}/.ssh/authorized_keys
 chown -R {self.username}:{self.username} /home/{self.username}/.ssh
+
+# Verify
+echo "SSH directory contents:"
+ls -la /home/{self.username}/.ssh/
+echo "Authorized keys:"
+wc -l /home/{self.username}/.ssh/authorized_keys
 echo "✅ SSH keys configured"
 
 # ═══════════════════════════════════════════════════════════
@@ -130,8 +186,13 @@ apt-get install -y nodejs
 # Install PM2 and pnpm globally
 npm install -g pm2 pnpm 2>&1 | grep -v "npm WARN" || true
 
-# Setup PM2 startup
-env PATH=$PATH:/usr/bin /usr/lib/node_modules/pm2/bin/pm2 startup systemd -u {self.username} --hp /home/{self.username} 2>&1 | tail -5
+# Setup PM2 startup for deploy user
+echo "Setting up PM2 for user {self.username}..."
+su - {self.username} -c "pm2 startup" | tail -1 > /tmp/pm2_startup_cmd.sh
+if [ -s /tmp/pm2_startup_cmd.sh ]; then
+    bash /tmp/pm2_startup_cmd.sh
+    rm /tmp/pm2_startup_cmd.sh
+fi
 
 echo "Node.js: $(node --version)"
 echo "npm: $(npm --version)"
@@ -154,13 +215,14 @@ echo "[8/10] Deploying application..."
 mkdir -p /opt/hosting-manager
 chown {self.username}:{self.username} /opt/hosting-manager
 
-# Clone repository
+# Clone repository as deploy user
 if [ -d "/opt/hosting-manager/.git" ]; then
     echo "Updating existing repository..."
-    cd /opt/hosting-manager && git pull origin main
+    cd /opt/hosting-manager
+    sudo -u {self.username} git pull origin main
 else
     echo "Cloning repository..."
-    su - {self.username} -c "git clone {self.repo_url} /opt/hosting-manager"
+    sudo -u {self.username} git clone {self.repo_url} /opt/hosting-manager
 fi
 
 # Install Python requirements
@@ -258,7 +320,7 @@ nginx -t 2>&1 && systemctl reload nginx
 echo "✅ Nginx configured"
 
 # ═══════════════════════════════════════════════════════════
-# STEP 10: Verify Installation
+# STEP 10: Verify Installation & Test SSH
 # ═══════════════════════════════════════════════════════════
 echo "[10/10] Verifying installation..."
 
@@ -277,6 +339,11 @@ if curl -f http://localhost:5000/api/health 2>/dev/null; then
 else
     echo "⚠️  API not responding yet (may need more time)"
 fi
+
+# Test SSH login for deploy user
+echo ""
+echo "Testing SSH access for {self.username} user..."
+su - {self.username} -c "echo 'SSH access works!'" && echo "✅ Deploy user can login"
 
 echo ""
 echo "============================================"
@@ -303,6 +370,8 @@ echo "  Status:  ssh {self.username}@{self.server} 'sudo systemctl status hostin
 echo "  Logs:    ssh {self.username}@{self.server} 'sudo journalctl -u hosting-manager -f'"
 echo "  PM2:     ssh {self.username}@{self.server} 'pm2 list'"
 echo ""
+echo "✅ You should now be able to: ssh {self.username}@{self.server}"
+echo ""
 """
     
     def install(self):
@@ -311,6 +380,7 @@ echo ""
         print(f"Server:     {self.server}")
         print(f"User:       {self.username}")
         print(f"Repository: {self.repo_url}")
+        print(f"SSH Key:    {self.ssh_public_key[:50]}...")
         print()
         
         # Check prerequisites
@@ -364,8 +434,26 @@ echo ""
             print()
             print_header("✅ Installation Successful!")
             
-            # Test from local machine
-            print_step("Testing installation from your local machine...")
+            # Test SSH connection as deploy user
+            print_step(f"Testing SSH connection as {self.username} user...")
+            time.sleep(2)
+            
+            test_result = subprocess.run(
+                f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 {self.username}@{self.server} 'echo SSH works'",
+                shell=True,
+                capture_output=True,
+                text=True
+            )
+            
+            if test_result.returncode == 0:
+                print_success(f"✅ Can SSH as {self.username} user!")
+            else:
+                print_error(f"❌ Cannot SSH as {self.username} user")
+                print(f"Error: {test_result.stderr}")
+                print_warning("Try: ssh -v {self.username}@{self.server}")
+            
+            # Test API
+            print_step("Testing API from your local machine...")
             time.sleep(2)
             
             try:
@@ -378,12 +466,12 @@ echo ""
                 )
                 
                 if result.returncode == 0:
-                    print_success("✅ API is accessible from your machine!")
+                    print_success("✅ API is accessible!")
                     print(f"\n{result.stdout}\n")
                 else:
-                    print_warning("⚠️  API not accessible yet (may need DNS propagation)")
+                    print_warning("⚠️  API not accessible yet")
             except:
-                print_warning("⚠️  Could not test from local machine")
+                print_warning("⚠️  Could not test API")
             
             # Print final summary
             self.print_final_summary()
@@ -402,17 +490,15 @@ echo ""
         """Print final summary"""
         print(f"{Colors.BLUE}{'='*60}{Colors.NC}")
         print(f"{Colors.CYAN}📚 Next Steps:{Colors.NC}\n")
-        print(f"1. Test your API:")
+        print(f"1. Test SSH access:")
+        print(f"   ssh {self.username}@{self.server}\n")
+        print(f"2. Test API:")
         print(f"   curl http://{self.server}/api/health\n")
-        print(f"2. Deploy your first app:")
+        print(f"3. Deploy your first app:")
         print(f"   Use the /api/deploy/nodejs endpoint\n")
-        print(f"3. Monitor your server:")
+        print(f"4. Monitor with PM2:")
         print(f"   ssh {self.username}@{self.server}")
         print(f"   pm2 list\n")
-        print(f"4. Configure SSL (optional):")
-        print(f"   ssh {self.username}@{self.server}")
-        print(f"   sudo apt install certbot python3-certbot-nginx")
-        print(f"   sudo certbot --nginx\n")
         print(f"{Colors.BLUE}{'='*60}{Colors.NC}")
 
 def main():
@@ -421,39 +507,23 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # With root password (requires sshpass)
+  # With root password
   python3 fresh_install.py --server 75.119.141.162 --user deploy \\
     --repo https://github.com/joggit/hosting-mvp.git --root-password PASSWORD
   
-  # With SSH key (no password needed)
+  # With SSH key
   python3 fresh_install.py --server 75.119.141.162 --user deploy \\
     --repo https://github.com/joggit/hosting-mvp.git
-
-What gets installed:
-  ✓ Node.js 20.x LTS + npm
-  ✓ PM2 (Process Manager)
-  ✓ pnpm (Fast Package Manager)
-  ✓ Python 3 + Flask
-  ✓ Nginx (Web Server)
-  ✓ SQLite (Database)
-  ✓ UFW Firewall
-  ✓ Fail2ban (Security)
         """
     )
     
-    parser.add_argument('--server', required=True, help='Server IP address or hostname')
-    parser.add_argument('--user', required=True, help='Username to create (e.g., deploy)')
+    parser.add_argument('--server', required=True, help='Server IP address')
+    parser.add_argument('--user', required=True, help='Username to create')
     parser.add_argument('--repo', required=True, help='Git repository URL')
-    parser.add_argument('--root-password', help='Root password (if not using SSH key)')
+    parser.add_argument('--root-password', help='Root password')
     
     args = parser.parse_args()
     
-    # Validate inputs
-    if not args.server or not args.user or not args.repo:
-        parser.print_help()
-        sys.exit(1)
-    
-    # Run installation
     installer = FreshInstaller(
         server=args.server,
         username=args.user,
