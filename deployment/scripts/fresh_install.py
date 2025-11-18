@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Hosting Manager - Fresh Server Installation
-Fixed version with better SSH connection handling
+Single-session approach for reliable installation
 """
 
 import argparse
@@ -18,8 +18,8 @@ class Colors:
     CYAN = '\033[0;36m'
     NC = '\033[0m'
 
-def print_step(step, total, message):
-    print(f"{Colors.GREEN}[{step}/{total}] {message}{Colors.NC}")
+def print_step(message):
+    print(f"{Colors.GREEN}▶ {message}{Colors.NC}")
 
 def print_success(message):
     print(f"{Colors.GREEN}✅ {message}{Colors.NC}")
@@ -30,186 +30,83 @@ def print_error(message):
 def print_warning(message):
     print(f"{Colors.YELLOW}⚠️  {message}{Colors.NC}")
 
-def run_ssh_command(server, user, command, password=None, retries=3):
-    """Execute command on remote server via SSH with retries"""
-    for attempt in range(retries):
-        if password:
-            ssh_cmd = f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=60 -o ServerAliveCountMax=3 {user}@{server} '{command}'"
-        else:
-            ssh_cmd = f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=60 -o ServerAliveCountMax=3 {user}@{server} '{command}'"
-        
-        result = subprocess.run(ssh_cmd, shell=True, capture_output=True, text=True)
-        
-        if result.returncode == 0 or attempt == retries - 1:
-            return result
-        
-        # Connection failed, wait and retry
-        if "Connection reset" in result.stderr or "Connection refused" in result.stderr:
-            print_warning(f"Connection issue, retrying in 5 seconds... (attempt {attempt + 1}/{retries})")
-            time.sleep(5)
-        else:
-            return result
-    
-    return result
+def print_header(message):
+    print(f"\n{Colors.BLUE}{'='*60}{Colors.NC}")
+    print(f"{Colors.BLUE}{message}{Colors.NC}")
+    print(f"{Colors.BLUE}{'='*60}{Colors.NC}\n")
 
 class FreshInstaller:
-    """Handles fresh server installation"""
+    """Handles fresh server installation in a single SSH session"""
     
     def __init__(self, server, username, repo_url, root_password=None):
         self.server = server
         self.username = username
         self.repo_url = repo_url
         self.root_password = root_password
-        self.total_steps = 10
-        self.use_root = True  # Start with root, switch to user after setup
     
-    def install(self):
-        """Run complete installation"""
-        print(f"{Colors.BLUE}{'='*60}{Colors.NC}")
-        print(f"{Colors.BLUE}🚀 Fresh Server Installation - Hosting Manager{Colors.NC}")
-        print(f"{Colors.BLUE}{'='*60}{Colors.NC}")
-        print(f"Server: {self.server}")
-        print(f"User: {self.username}")
-        print(f"Repository: {self.repo_url}")
-        print()
-        
-        try:
-            self.step1_update_system()
-            self.step2_create_user()
-            self.step3_setup_ssh_keys()
-            # Note: We do SSH hardening LAST now
-            self.step4_setup_firewall()
-            self.step5_setup_fail2ban()
-            self.step6_install_nodejs_ecosystem()
-            self.step7_install_python_dependencies()
-            self.step8_deploy_application()
-            self.step9_configure_nginx()
-            self.step10_verify_installation()
-            
-            # Only secure SSH after everything works
-            self.secure_ssh_final()
-            
-            self.print_summary()
-            
-        except Exception as e:
-            print_error(f"Installation failed: {e}")
-            import traceback
-            traceback.print_exc()
-            sys.exit(1)
-    
-    def step1_update_system(self):
-        """Update system packages"""
-        print_step(1, self.total_steps, "Updating system packages...")
-        
-        commands = [
-            "apt-get update -qq",
-            "DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq",
-            "apt-get install -y curl wget git vim ufw fail2ban"
-        ]
-        
-        for cmd in commands:
-            result = run_ssh_command(self.server, "root", cmd, self.root_password)
-            if result.returncode != 0:
-                print_warning(f"Command warning: {cmd}")
-        
-        print_success("System updated")
-    
-    def step2_create_user(self):
-        """Create deployment user"""
-        print_step(2, self.total_steps, f"Creating user: {self.username}...")
-        
-        # Check if user exists
-        check_cmd = f"id {self.username} 2>/dev/null"
-        result = run_ssh_command(self.server, "root", check_cmd, self.root_password)
-        
-        if result.returncode == 0:
-            print_warning(f"User {self.username} already exists")
-        else:
-            # Create user
-            create_user = f"""
-            adduser --disabled-password --gecos '' {self.username}
-            usermod -aG sudo {self.username}
-            """
-            
-            result = run_ssh_command(self.server, "root", create_user, self.root_password)
-            
-            if result.returncode != 0:
-                print_error("Failed to create user")
-                raise Exception(f"User creation failed")
-        
-        # Setup sudo access (even if user exists)
-        sudo_cmd = f"echo '{self.username} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/{self.username} && chmod 440 /etc/sudoers.d/{self.username}"
-        run_ssh_command(self.server, "root", sudo_cmd, self.root_password)
-        
-        print_success(f"User {self.username} ready")
-    
-    def step3_setup_ssh_keys(self):
-        """Setup SSH key authentication"""
-        print_step(3, self.total_steps, "Setting up SSH keys...")
-        
-        # Find SSH public key
-        ssh_key_path = Path.home() / '.ssh' / 'id_ed25519.pub'
-        if not ssh_key_path.exists():
-            ssh_key_path = Path.home() / '.ssh' / 'id_rsa.pub'
-        
-        if not ssh_key_path.exists():
-            print_warning("No SSH key found. Generating new key...")
-            subprocess.run("ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519", shell=True, check=True)
-            ssh_key_path = Path.home() / '.ssh' / 'id_ed25519.pub'
-        
-        public_key = ssh_key_path.read_text().strip()
-        
-        # Setup SSH directory and keys
-        ssh_setup = f"""
-        mkdir -p /home/{self.username}/.ssh
-        echo '{public_key}' > /home/{self.username}/.ssh/authorized_keys
-        chmod 700 /home/{self.username}/.ssh
-        chmod 600 /home/{self.username}/.ssh/authorized_keys
-        chown -R {self.username}:{self.username} /home/{self.username}/.ssh
-        """
-        
-        run_ssh_command(self.server, "root", ssh_setup, self.root_password)
-        
-        # Test if we can connect as the new user with SSH key
-        test_result = run_ssh_command(self.server, self.username, "echo 'SSH key works'", None)
-        
-        if test_result.returncode == 0:
-            print_success("SSH keys configured and working")
-            self.use_root = False  # Switch to using the deploy user
-            self.root_password = None  # No longer need password
-        else:
-            print_warning("SSH key test failed, continuing with root")
-    
-    def step4_setup_firewall(self):
-        """Configure UFW firewall"""
-        print_step(4, self.total_steps, "Configuring firewall...")
-        
-        user = "root" if self.use_root else self.username
-        password = self.root_password if self.use_root else None
-        
-        commands = [
-            "ufw --force enable",
-            "ufw allow OpenSSH",
-            "ufw allow 22/tcp",
-            "ufw allow 80/tcp",
-            "ufw allow 443/tcp",
-            "ufw allow 5000/tcp"
-        ]
-        
-        for cmd in commands:
-            run_ssh_command(self.server, user, f"sudo {cmd}" if not self.use_root else cmd, password)
-        
-        print_success("Firewall configured")
-    
-    def step5_setup_fail2ban(self):
-        """Setup fail2ban"""
-        print_step(5, self.total_steps, "Setting up fail2ban...")
-        
-        user = "root" if self.use_root else self.username
-        password = self.root_password if self.use_root else None
-        
-        fail2ban_config = """
-        cat > /etc/fail2ban/jail.local << 'F2B'
+    def build_installation_script(self):
+        """Build the complete installation script"""
+        return f"""
+set -e  # Exit on any error
+
+echo "============================================"
+echo "Starting Hosting Manager Installation"
+echo "============================================"
+echo ""
+
+# ═══════════════════════════════════════════════════════════
+# STEP 1: Update System
+# ═══════════════════════════════════════════════════════════
+echo "[1/10] Updating system packages..."
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq
+apt-get install -y curl wget git vim ufw fail2ban
+echo "✅ System updated"
+
+# ═══════════════════════════════════════════════════════════
+# STEP 2: Create User
+# ═══════════════════════════════════════════════════════════
+echo "[2/10] Setting up user {self.username}..."
+if id "{self.username}" &>/dev/null; then
+    echo "User {self.username} already exists"
+else
+    adduser --disabled-password --gecos '' {self.username}
+fi
+
+# Ensure sudo access
+usermod -aG sudo {self.username}
+echo '{self.username} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/{self.username}
+chmod 440 /etc/sudoers.d/{self.username}
+echo "✅ User {self.username} ready"
+
+# ═══════════════════════════════════════════════════════════
+# STEP 3: Setup SSH Keys
+# ═══════════════════════════════════════════════════════════
+echo "[3/10] Setting up SSH keys..."
+mkdir -p /home/{self.username}/.ssh
+cat /root/.ssh/authorized_keys > /home/{self.username}/.ssh/authorized_keys 2>/dev/null || echo "No root keys to copy"
+chmod 700 /home/{self.username}/.ssh
+chmod 600 /home/{self.username}/.ssh/authorized_keys 2>/dev/null || true
+chown -R {self.username}:{self.username} /home/{self.username}/.ssh
+echo "✅ SSH keys configured"
+
+# ═══════════════════════════════════════════════════════════
+# STEP 4: Configure Firewall
+# ═══════════════════════════════════════════════════════════
+echo "[4/10] Configuring firewall..."
+ufw --force enable
+ufw allow OpenSSH
+ufw allow 22/tcp
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw allow 5000/tcp
+echo "✅ Firewall configured"
+
+# ═══════════════════════════════════════════════════════════
+# STEP 5: Setup Fail2ban
+# ═══════════════════════════════════════════════════════════
+echo "[5/10] Setting up fail2ban..."
+cat > /etc/fail2ban/jail.local << 'F2B'
 [DEFAULT]
 bantime = 3600
 findtime = 600
@@ -219,86 +116,63 @@ maxretry = 5
 enabled = true
 F2B
 
-        systemctl enable fail2ban
-        systemctl restart fail2ban
-        """
-        
-        cmd = f"sudo bash -c '{fail2ban_config}'" if not self.use_root else fail2ban_config
-        run_ssh_command(self.server, user, cmd, password)
-        print_success("Fail2ban configured")
-    
-    def step6_install_nodejs_ecosystem(self):
-        """Install Node.js, npm, PM2, and pnpm"""
-        print_step(6, self.total_steps, "Installing Node.js ecosystem...")
-        
-        user = "root" if self.use_root else self.username
-        password = self.root_password if self.use_root else None
-        
-        install_script = f"""
-        curl -fsSL https://deb.nodesource.com/setup_20.x | {'bash -' if self.use_root else 'sudo bash -'}
-        {'apt-get' if self.use_root else 'sudo apt-get'} install -y nodejs
-        {'npm' if self.use_root else 'sudo npm'} install -g pm2 pnpm
-        env PATH=$PATH:/usr/bin /usr/lib/node_modules/pm2/bin/pm2 startup systemd -u {self.username} --hp /home/{self.username}
-        """
-        
-        result = run_ssh_command(self.server, user, install_script, password)
-        
-        if result.returncode == 0:
-            print_success("Node.js ecosystem installed")
-        else:
-            print_warning("Node.js installation had some warnings")
-    
-    def step7_install_python_dependencies(self):
-        """Install Python and dependencies"""
-        print_step(7, self.total_steps, "Installing Python dependencies...")
-        
-        user = "root" if self.use_root else self.username
-        password = self.root_password if self.use_root else None
-        
-        sudo_prefix = "" if self.use_root else "sudo "
-        
-        commands = [
-            f"{sudo_prefix}apt-get install -y python3 python3-pip python3-venv nginx sqlite3",
-            f"{sudo_prefix}pip3 install --break-system-packages Flask==3.0.0 Flask-CORS==4.0.0",
-        ]
-        
-        for cmd in commands:
-            run_ssh_command(self.server, user, cmd, password)
-        
-        print_success("Python dependencies installed")
-    
-    def step8_deploy_application(self):
-        """Deploy the application"""
-        print_step(8, self.total_steps, "Deploying application...")
-        
-        user = "root" if self.use_root else self.username
-        password = self.root_password if self.use_root else None
-        sudo_prefix = "" if self.use_root else "sudo "
-        
-        deploy_script = f"""
-        # Create directory structure
-        {sudo_prefix}mkdir -p /opt/hosting-manager
-        {sudo_prefix}chown {self.username}:{self.username} /opt/hosting-manager
-        
-        # Clone repository
-        if [ -d "/opt/hosting-manager/.git" ]; then
-            cd /opt/hosting-manager && git pull origin main
-        else
-            su - {self.username} -c "git clone {self.repo_url} /opt/hosting-manager"
-        fi
-        
-        # Install Python requirements
-        cd /opt/hosting-manager
-        {sudo_prefix}pip3 install --break-system-packages -r requirements.txt
-        
-        # Create data directories
-        {sudo_prefix}mkdir -p /var/lib/hosting-manager /var/log/hosting-manager /var/www/domains
-        {sudo_prefix}chown -R {self.username}:{self.username} /var/lib/hosting-manager
-        {sudo_prefix}chown -R {self.username}:{self.username} /var/log/hosting-manager
-        {sudo_prefix}chown -R {self.username}:{self.username} /var/www/domains
-        
-        # Create systemd service
-        {sudo_prefix}tee /etc/systemd/system/hosting-manager.service > /dev/null << 'SERVICE'
+systemctl enable fail2ban
+systemctl restart fail2ban
+echo "✅ Fail2ban configured"
+
+# ═══════════════════════════════════════════════════════════
+# STEP 6: Install Node.js Ecosystem
+# ═══════════════════════════════════════════════════════════
+echo "[6/10] Installing Node.js ecosystem..."
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash - 2>&1 | grep -v "^#" || true
+apt-get install -y nodejs
+
+# Install PM2 and pnpm globally
+npm install -g pm2 pnpm 2>&1 | grep -v "npm WARN" || true
+
+# Setup PM2 startup
+env PATH=$PATH:/usr/bin /usr/lib/node_modules/pm2/bin/pm2 startup systemd -u {self.username} --hp /home/{self.username} 2>&1 | tail -5
+
+echo "Node.js: $(node --version)"
+echo "npm: $(npm --version)"
+echo "PM2: $(pm2 --version)"
+echo "pnpm: $(pnpm --version)"
+echo "✅ Node.js ecosystem installed"
+
+# ═══════════════════════════════════════════════════════════
+# STEP 7: Install Python Dependencies
+# ═══════════════════════════════════════════════════════════
+echo "[7/10] Installing Python dependencies..."
+apt-get install -y python3 python3-pip python3-venv nginx sqlite3
+pip3 install --break-system-packages Flask==3.0.0 Flask-CORS==4.0.0 2>&1 | grep -v "WARNING" || true
+echo "✅ Python dependencies installed"
+
+# ═══════════════════════════════════════════════════════════
+# STEP 8: Deploy Application
+# ═══════════════════════════════════════════════════════════
+echo "[8/10] Deploying application..."
+mkdir -p /opt/hosting-manager
+chown {self.username}:{self.username} /opt/hosting-manager
+
+# Clone repository
+if [ -d "/opt/hosting-manager/.git" ]; then
+    echo "Updating existing repository..."
+    cd /opt/hosting-manager && git pull origin main
+else
+    echo "Cloning repository..."
+    su - {self.username} -c "git clone {self.repo_url} /opt/hosting-manager"
+fi
+
+# Install Python requirements
+cd /opt/hosting-manager
+pip3 install --break-system-packages -r requirements.txt 2>&1 | grep -v "WARNING" || true
+
+# Create data directories
+mkdir -p /var/lib/hosting-manager /var/log/hosting-manager /var/www/domains
+chown -R {self.username}:{self.username} /var/lib/hosting-manager /var/log/hosting-manager /var/www/domains
+
+# Create systemd service
+cat > /etc/systemd/system/hosting-manager.service << 'SERVICE'
 [Unit]
 Description=Hosting Manager API
 After=network.target
@@ -320,35 +194,29 @@ StandardError=journal
 WantedBy=multi-user.target
 SERVICE
 
-        # Enable and start service
-        {sudo_prefix}systemctl daemon-reload
-        {sudo_prefix}systemctl enable hosting-manager
-        {sudo_prefix}systemctl restart hosting-manager
-        
-        sleep 5
-        """
-        
-        result = run_ssh_command(self.server, user, deploy_script, password)
-        
-        if result.returncode != 0:
-            print_error("Deployment had issues")
-            print(result.stderr[:500])
-            # Don't raise exception, continue to verify
-        
-        print_success("Application deployed")
-    
-    def step9_configure_nginx(self):
-        """Configure nginx"""
-        print_step(9, self.total_steps, "Configuring nginx...")
-        
-        user = "root" if self.use_root else self.username
-        password = self.root_password if self.use_root else None
-        sudo_prefix = "" if self.use_root else "sudo "
-        
-        nginx_config = f"""
-        {sudo_prefix}rm -f /etc/nginx/sites-enabled/default
-        
-        {sudo_prefix}tee /etc/nginx/sites-available/hosting-manager-api > /dev/null << 'NGINX'
+# Enable and start service
+systemctl daemon-reload
+systemctl enable hosting-manager
+systemctl restart hosting-manager
+
+# Wait for service to start
+sleep 5
+
+# Check if service started
+if systemctl is-active --quiet hosting-manager; then
+    echo "✅ Application deployed and running"
+else
+    echo "⚠️  Service may need a moment to start"
+    journalctl -u hosting-manager -n 10 --no-pager
+fi
+
+# ═══════════════════════════════════════════════════════════
+# STEP 9: Configure Nginx
+# ═══════════════════════════════════════════════════════════
+echo "[9/10] Configuring nginx..."
+rm -f /etc/nginx/sites-enabled/default
+
+cat > /etc/nginx/sites-available/hosting-manager-api << 'NGINX'
 server {{
     listen 80 default_server;
     server_name _;
@@ -356,115 +224,243 @@ server {{
     location /api/ {{
         proxy_pass http://127.0.0.1:5000;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \\$http_upgrade;
+        proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection 'upgrade';
-        proxy_set_header Host \\$host;
-        proxy_set_header X-Real-IP \\$remote_addr;
-        proxy_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \\$scheme;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_cache_bypass $http_upgrade;
     }}
 
     location / {{
         default_type text/html;
-        return 200 '<!DOCTYPE html><html><head><title>Hosting Manager</title></head><body style="font-family:Arial;max-width:800px;margin:50px auto;padding:20px;"><h1>🚀 Hosting Manager Active</h1><p>Running successfully.</p><h2>API:</h2><ul><li><a href="/api/health">Health</a></li><li><a href="/api/status">Status</a></li><li><a href="/api/domains">Domains</a></li></ul></body></html>';
+        return 200 '<!DOCTYPE html>
+<html>
+<head><title>Hosting Manager</title></head>
+<body style="font-family:Arial;max-width:800px;margin:50px auto;padding:20px;">
+    <h1>🚀 Hosting Manager Active</h1>
+    <p>The hosting manager is running successfully.</p>
+    <h2>API Endpoints:</h2>
+    <ul>
+        <li><a href="/api/health">Health Check</a></li>
+        <li><a href="/api/status">Status</a></li>
+        <li><a href="/api/domains">Domains</a></li>
+    </ul>
+</body>
+</html>';
     }}
 }}
 NGINX
 
-        {sudo_prefix}ln -sf /etc/nginx/sites-available/hosting-manager-api /etc/nginx/sites-enabled/
-        {sudo_prefix}nginx -t && {sudo_prefix}systemctl reload nginx
-        """
-        
-        run_ssh_command(self.server, user, nginx_config, password)
-        print_success("Nginx configured")
+ln -sf /etc/nginx/sites-available/hosting-manager-api /etc/nginx/sites-enabled/
+nginx -t 2>&1 && systemctl reload nginx
+echo "✅ Nginx configured"
+
+# ═══════════════════════════════════════════════════════════
+# STEP 10: Verify Installation
+# ═══════════════════════════════════════════════════════════
+echo "[10/10] Verifying installation..."
+
+# Check service
+if systemctl is-active --quiet hosting-manager; then
+    echo "✅ Hosting Manager service is running"
+else
+    echo "❌ Hosting Manager service is not running"
+    systemctl status hosting-manager --no-pager
+fi
+
+# Test API
+sleep 2
+if curl -f http://localhost:5000/api/health 2>/dev/null; then
+    echo "✅ API is responding"
+else
+    echo "⚠️  API not responding yet (may need more time)"
+fi
+
+echo ""
+echo "============================================"
+echo "✅ Installation Complete!"
+echo "============================================"
+echo ""
+echo "🎯 Installed Components:"
+echo "  ✓ Node.js $(node --version)"
+echo "  ✓ npm $(npm --version)"
+echo "  ✓ PM2 $(pm2 --version)"
+echo "  ✓ pnpm $(pnpm --version)"
+echo "  ✓ Python 3 + Flask"
+echo "  ✓ Nginx with virtual hosting"
+echo "  ✓ UFW Firewall"
+echo "  ✓ Fail2ban"
+echo ""
+echo "📡 Server Access:"
+echo "  SSH:  ssh {self.username}@{self.server}"
+echo "  API:  http://{self.server}:5000/api/health"
+echo "  Web:  http://{self.server}"
+echo ""
+echo "🔧 Useful Commands:"
+echo "  Status:  ssh {self.username}@{self.server} 'sudo systemctl status hosting-manager'"
+echo "  Logs:    ssh {self.username}@{self.server} 'sudo journalctl -u hosting-manager -f'"
+echo "  PM2:     ssh {self.username}@{self.server} 'pm2 list'"
+echo ""
+"""
     
-    def step10_verify_installation(self):
-        """Verify installation"""
-        print_step(10, self.total_steps, "Verifying installation...")
-        
-        user = self.username  # Always use deploy user for verification
-        
-        # Check service
-        result = run_ssh_command(self.server, user, "systemctl is-active hosting-manager", None)
-        
-        if result.stdout.strip() == "active":
-            print_success("Hosting Manager service is running")
-        else:
-            print_warning("Service may not be running yet")
-        
-        # Test API
-        time.sleep(3)
-        result = run_ssh_command(self.server, user, "curl -f http://localhost:5000/api/health", None)
-        
-        if result.returncode == 0:
-            print_success("API is responding")
-        else:
-            print_warning("API not responding yet")
-        
-        # Check Node.js tools
-        for tool, cmd in [("Node.js", "node --version"), ("PM2", "pm2 --version"), ("pnpm", "pnpm --version")]:
-            result = run_ssh_command(self.server, user, cmd, None)
-            if result.returncode == 0:
-                print_success(f"{tool}: {result.stdout.strip()}")
-    
-    def secure_ssh_final(self):
-        """Secure SSH as final step"""
+    def install(self):
+        """Run installation via single SSH session"""
+        print_header("🚀 Fresh Server Installation - Hosting Manager")
+        print(f"Server:     {self.server}")
+        print(f"User:       {self.username}")
+        print(f"Repository: {self.repo_url}")
         print()
-        print(f"{Colors.YELLOW}Securing SSH (disabling root login)...{Colors.NC}")
         
-        # Only do this if we successfully switched to key-based auth
-        if not self.use_root:
-            ssh_config = """
-            sudo sed -i 's/#PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config
-            sudo sed -i 's/PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config
-            sudo systemctl restart sshd
-            """
+        # Check prerequisites
+        if self.root_password:
+            result = subprocess.run('which sshpass', shell=True, capture_output=True)
+            if result.returncode != 0:
+                print_error("sshpass is not installed")
+                print("Install it with: sudo apt-get install sshpass (Linux) or brew install hudochenkov/sshpass/sshpass (Mac)")
+                sys.exit(1)
+        
+        # Build the installation script
+        install_script = self.build_installation_script()
+        
+        print_step("Connecting to server and starting installation...")
+        print_warning("This will take several minutes. Please be patient...")
+        print()
+        
+        # Execute via SSH
+        try:
+            if self.root_password:
+                ssh_cmd = f"sshpass -p '{self.root_password}' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@{self.server} 'bash -s'"
+            else:
+                ssh_cmd = f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@{self.server} 'bash -s'"
             
-            run_ssh_command(self.server, self.username, ssh_config, None)
-            print_success("SSH secured - root login disabled")
-        else:
-            print_warning("Skipping SSH hardening (still using root password)")
+            # Run the installation
+            process = subprocess.Popen(
+                ssh_cmd,
+                shell=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+            
+            # Send the script
+            process.stdin.write(install_script)
+            process.stdin.close()
+            
+            # Show output in real-time
+            for line in process.stdout:
+                print(line, end='')
+            
+            # Wait for completion
+            return_code = process.wait()
+            
+            if return_code != 0:
+                print_error(f"Installation failed with exit code {return_code}")
+                sys.exit(1)
+            
+            print()
+            print_header("✅ Installation Successful!")
+            
+            # Test from local machine
+            print_step("Testing installation from your local machine...")
+            time.sleep(2)
+            
+            try:
+                result = subprocess.run(
+                    f"curl -f http://{self.server}/api/health",
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                
+                if result.returncode == 0:
+                    print_success("✅ API is accessible from your machine!")
+                    print(f"\n{result.stdout}\n")
+                else:
+                    print_warning("⚠️  API not accessible yet (may need DNS propagation)")
+            except:
+                print_warning("⚠️  Could not test from local machine")
+            
+            # Print final summary
+            self.print_final_summary()
+            
+        except KeyboardInterrupt:
+            print()
+            print_error("Installation interrupted by user")
+            sys.exit(1)
+        except Exception as e:
+            print_error(f"Installation failed: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
     
-    def print_summary(self):
-        """Print installation summary"""
-        print()
+    def print_final_summary(self):
+        """Print final summary"""
         print(f"{Colors.BLUE}{'='*60}{Colors.NC}")
-        print(f"{Colors.GREEN}✅ Installation Complete!{Colors.NC}")
-        print(f"{Colors.BLUE}{'='*60}{Colors.NC}\n")
-        
-        print(f"{Colors.CYAN}🎯 Installed:{Colors.NC}")
-        print(f"  ✓ Node.js 20.x + npm + PM2 + pnpm")
-        print(f"  ✓ Python 3 + Flask")
-        print(f"  ✓ Nginx")
-        print(f"  ✓ Firewall & Fail2ban")
-        print()
-        
-        print(f"{Colors.CYAN}📡 Access:{Colors.NC}")
-        print(f"  SSH:  ssh {self.username}@{self.server}")
-        print(f"  API:  http://{self.server}:5000/api/health")
-        print(f"  Web:  http://{self.server}")
-        print()
-        
-        print(f"{Colors.CYAN}🧪 Test:{Colors.NC}")
-        print(f"  curl http://{self.server}/api/health")
-        print()
+        print(f"{Colors.CYAN}📚 Next Steps:{Colors.NC}\n")
+        print(f"1. Test your API:")
+        print(f"   curl http://{self.server}/api/health\n")
+        print(f"2. Deploy your first app:")
+        print(f"   Use the /api/deploy/nodejs endpoint\n")
+        print(f"3. Monitor your server:")
+        print(f"   ssh {self.username}@{self.server}")
+        print(f"   pm2 list\n")
+        print(f"4. Configure SSL (optional):")
+        print(f"   ssh {self.username}@{self.server}")
+        print(f"   sudo apt install certbot python3-certbot-nginx")
+        print(f"   sudo certbot --nginx\n")
+        print(f"{Colors.BLUE}{'='*60}{Colors.NC}")
 
 def main():
-    parser = argparse.ArgumentParser(description='Fresh server installation')
-    parser.add_argument('--server', required=True, help='Server IP')
-    parser.add_argument('--user', required=True, help='Username to create')
-    parser.add_argument('--repo', required=True, help='Git repo URL')
-    parser.add_argument('--root-password', help='Root password')
+    parser = argparse.ArgumentParser(
+        description='Fresh server installation for Hosting Manager',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # With root password (requires sshpass)
+  python3 fresh_install.py --server 75.119.141.162 --user deploy \\
+    --repo https://github.com/joggit/hosting-mvp.git --root-password PASSWORD
+  
+  # With SSH key (no password needed)
+  python3 fresh_install.py --server 75.119.141.162 --user deploy \\
+    --repo https://github.com/joggit/hosting-mvp.git
+
+What gets installed:
+  ✓ Node.js 20.x LTS + npm
+  ✓ PM2 (Process Manager)
+  ✓ pnpm (Fast Package Manager)
+  ✓ Python 3 + Flask
+  ✓ Nginx (Web Server)
+  ✓ SQLite (Database)
+  ✓ UFW Firewall
+  ✓ Fail2ban (Security)
+        """
+    )
+    
+    parser.add_argument('--server', required=True, help='Server IP address or hostname')
+    parser.add_argument('--user', required=True, help='Username to create (e.g., deploy)')
+    parser.add_argument('--repo', required=True, help='Git repository URL')
+    parser.add_argument('--root-password', help='Root password (if not using SSH key)')
     
     args = parser.parse_args()
     
-    if args.root_password:
-        result = subprocess.run('which sshpass', shell=True, capture_output=True)
-        if result.returncode != 0:
-            print_error("Install sshpass: sudo apt-get install sshpass")
-            sys.exit(1)
+    # Validate inputs
+    if not args.server or not args.user or not args.repo:
+        parser.print_help()
+        sys.exit(1)
     
-    installer = FreshInstaller(args.server, args.user, args.repo, args.root_password)
+    # Run installation
+    installer = FreshInstaller(
+        server=args.server,
+        username=args.user,
+        repo_url=args.repo,
+        root_password=args.root_password
+    )
+    
     installer.install()
 
 if __name__ == '__main__':
