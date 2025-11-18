@@ -1,111 +1,70 @@
-# Deployment Guide - Python Scripts
+# Hosting Manager - Deployment Guide
 
-All deployment scripts are Python-based for consistency and cross-platform compatibility.
+## Fresh Installation
 
-## Quick Start - Single Server
+For a brand new server:
 ```bash
-# On the server
-curl -o deploy.py https://raw.githubusercontent.com/YOUR_USERNAME/hosting-mvp/main/deployment/scripts/deploy.py
-chmod +x deploy.py
-sudo python3 deploy.py https://github.com/YOUR_USERNAME/hosting-mvp.git
+python3 deployment/scripts/fresh_install.py \
+  --server 75.119.141.162 \
+  --user deploy \
+  --repo https://github.com/yourusername/hosting-mvp.git \
+  --root-password YOUR_PASSWORD
 ```
 
-## Multi-Server Deployment
-```bash
-# On your local machine (requires Python 3.7+)
-pip3 install requests  # For health checks
+This installs:
+- ✅ Node.js 20.x LTS
+- ✅ npm, PM2, pnpm
+- ✅ Python 3 + Flask
+- ✅ Nginx with virtual hosting
+- ✅ SQLite
+- ✅ Firewall & Security
 
-cd deployment/scripts
-python3 deploy_multi.py \
-  --repo https://github.com/YOUR_USERNAME/hosting-mvp.git \
-  --parallel 5 \
-  server1.com server2.com server3.com
+## Update Existing Installation
+```bash
+python3 deployment/scripts/deploy.py \
+  --server 75.119.141.162 \
+  --user deploy
 ```
 
-## Update Existing Deployment
+## Manual Commands
+
+### Update code
 ```bash
-# On the server
-sudo python3 /opt/hosting-manager/deployment/scripts/update.py
+ssh deploy@SERVER 'cd /opt/hosting-manager && git pull && sudo systemctl restart hosting-manager'
 ```
 
-## Rollback
+### View logs
 ```bash
-# On the server
-sudo python3 /opt/hosting-manager/deployment/scripts/rollback.py
+ssh deploy@SERVER 'sudo journalctl -u hosting-manager -f'
 ```
 
-## Health Check
+### Check PM2 processes
 ```bash
-# From local machine
-cd deployment/scripts
-python3 health_check.py server1.com server2.com server3.com
+ssh deploy@SERVER 'pm2 list'
+ssh deploy@SERVER 'pm2 logs APP_NAME'
 ```
 
-## Script Options
-
-### deploy.py
+### Test deployment
 ```bash
-sudo python3 deploy.py <repo-url> [--branch main] [--dir /opt/hosting-manager]
+curl http://SERVER:5000/api/health
 ```
-
-### deploy_multi.py
-```bash
-python3 deploy_multi.py \
-  --repo <repo-url> \
-  --branch main \
-  --parallel 3 \
-  server1 server2 server3
-```
-
-### health_check.py
-```bash
-python3 health_check.py [--port 5000] server1 server2 server3
-```
-
-## Examples
-
-### Deploy to Single Server
-```bash
-sudo python3 deploy.py https://github.com/user/hosting-mvp.git
-```
-
-### Deploy to Multiple Servers (3 at a time)
-```bash
-python3 deploy_multi.py \
-  --repo https://github.com/user/hosting-mvp.git \
-  --parallel 3 \
-  75.119.141.162 192.168.1.100 192.168.1.101
-```
-
-### Check Health of All Servers
-```bash
-python3 health_check.py 75.119.141.162 192.168.1.100 192.168.1.101
-```
-
-## Requirements
-
-- Python 3.7+
-- SSH access to servers (for multi-deploy)
-- Root access on target servers
 
 ## Troubleshooting
 
-**Deployment fails:**
+### Service won't start
 ```bash
-# Check service logs
-ssh root@server "journalctl -u hosting-manager -n 50"
+ssh deploy@SERVER 'sudo journalctl -u hosting-manager -n 50'
 ```
 
-**Health check fails:**
+### PM2 issues
 ```bash
-# Verify port is accessible
-curl http://server:5000/api/health
+ssh deploy@SERVER 'pm2 list'
+ssh deploy@SERVER 'pm2 logs --lines 100'
+ssh deploy@SERVER 'pm2 delete all && pm2 save'
 ```
 
-**Update fails:**
+### Nginx issues
 ```bash
-# Check git status
-cd /opt/hosting-manager
-git status
-git log -5
+ssh deploy@SERVER 'sudo nginx -t'
+ssh deploy@SERVER 'sudo systemctl status nginx'
 ```

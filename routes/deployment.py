@@ -173,7 +173,7 @@ def register_routes(app):
                         app.logger.info(f"Package.json fixes: {fixes_applied}")
 
                 except json.JSONDecodeError as e:
-                    app.logger.error(f"Invalid package.json: {e}")
+                    app.logger.error(f"❌ Invalid package.json: {e}")
                     return (
                         jsonify(
                             {"success": False, "error": "Invalid package.json format"}
@@ -181,7 +181,7 @@ def register_routes(app):
                         400,
                     )
 
-            # Add next.config.js if missing
+            # Add next.config.js if missing or fix incompatible options
             if (
                 "next.config.js" not in project_files
                 and "next.config.mjs" not in project_files
@@ -189,12 +189,39 @@ def register_routes(app):
                 project_files[
                     "next.config.js"
                 ] = """/** @type {import('next').NextConfig} */
+            const nextConfig = {
+            reactStrictMode: true,
+            swcMinify: true,
+            };
+
+            module.exports = nextConfig;"""
+                app.logger.info("Added next.config.js")
+            else:
+                # Check if next.config.js has incompatible options
+                config_key = (
+                    "next.config.js"
+                    if "next.config.js" in project_files
+                    else "next.config.mjs"
+                )
+                config_content = project_files[config_key]
+
+                # Remove serverExternalPackages if present (Next.js 15+ feature)
+                if "serverExternalPackages" in config_content:
+                    app.logger.warning(
+                        "Removing serverExternalPackages from next.config (requires Next.js 15+)"
+                    )
+                    # For simplicity, use a safe default config
+                    project_files[
+                        config_key
+                    ] = """/** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
   swcMinify: true,
+  compress: true
 };
 
 module.exports = nextConfig;"""
+
                 app.logger.info("Added next.config.js")
 
             # ═══════════════════════════════════════════════════════════
@@ -212,14 +239,25 @@ module.exports = nextConfig;"""
             # STEP 5: Create app directory and write files
             # ═══════════════════════════════════════════════════════════
             app_dir = f"{CONFIG['web_root']}/{site_name}"
-            app.logger.info(f"Checking if app directory exists: {app_dir}")
+
+            app.logger.info(f"Checking app directory: {app_dir}")
 
             if os.path.exists(app_dir):
-                error_msg = (
-                    f"Application directory '{site_name}' already exists at {app_dir}"
-                )
-                app.logger.error(f"❌ {error_msg}")
-                return jsonify({"success": False, "error": error_msg}), 400
+                app.logger.warning(f"⚠️  Directory exists, cleaning up: {app_dir}")
+                try:
+                    shutil.rmtree(app_dir)
+                    app.logger.info(f"✅ Cleaned up old directory")
+                except Exception as e:
+                    app.logger.error(f"❌ Failed to clean directory: {e}")
+                    return (
+                        jsonify(
+                            {
+                                "success": False,
+                                "error": f"Directory exists and cannot be removed: {str(e)}",
+                            }
+                        ),
+                        400,
+                    )
 
             app.logger.info(f"Creating app directory: {app_dir}")
             os.makedirs(app_dir, exist_ok=True)
@@ -237,8 +275,6 @@ module.exports = nextConfig;"""
             # ═══════════════════════════════════════════════════════════
             # STEP 6: Install dependencies
             # ═══════════════════════════════════════════════════════════
-            # In routes/deployment.py, replace the npm install section:
-
             if "package.json" in project_files:
                 app.logger.info(
                     "Running npm install (this may take several minutes)..."
@@ -327,7 +363,7 @@ module.exports = nextConfig;"""
                 if pm2_exists:
                     app.logger.info(f"Starting with PM2 at {pm2_path}...")
 
-                    # Create PM2 ecosystem file for better control
+                    # Create PM2 ecosystem file with FORK mode (critical for Next.js)
                     ecosystem = {
                         "apps": [
                             {
@@ -340,6 +376,7 @@ module.exports = nextConfig;"""
                                     "NODE_ENV": "production",
                                 },
                                 "instances": 1,
+                                "exec_mode": "fork",  # CRITICAL: Use fork mode for Next.js
                                 "autorestart": True,
                                 "watch": False,
                                 "max_memory_restart": "1G",
@@ -390,9 +427,10 @@ module.exports = nextConfig;"""
             if full_domain:
                 app.logger.info(f"Creating nginx config for {full_domain}")
 
+                # Create nginx config
                 nginx_config = f"""server {{
     listen 80;
-    server_name {full_domain};
+    server_name {full_domain} www.{full_domain};
     
     location / {{
         proxy_pass http://localhost:{allocated_port};
@@ -403,30 +441,62 @@ module.exports = nextConfig;"""
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_cache_bypass $http_upgrade;
+        
+        # Timeouts
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
     }}
 }}"""
 
                 try:
                     nginx_path = f"/etc/nginx/sites-available/{full_domain}"
-                    with open(nginx_path, "w") as f:
+                    app.logger.info(f"Writing nginx config to: {nginx_path}")
+
+                    # Write config using sudo
+                    with open("/tmp/nginx_config.tmp", "w") as f:
                         f.write(nginx_config)
+
+                    subprocess.run(
+                        ["sudo", "cp", "/tmp/nginx_config.tmp", nginx_path], check=True
+                    )
+                    os.remove("/tmp/nginx_config.tmp")
 
                     # Enable site
                     enabled_path = f"/etc/nginx/sites-enabled/{full_domain}"
-                    if os.path.exists(enabled_path):
-                        os.remove(enabled_path)
-                    os.symlink(nginx_path, enabled_path)
+                    subprocess.run(["sudo", "rm", "-f", enabled_path], check=False)
+                    subprocess.run(
+                        ["sudo", "ln", "-sf", nginx_path, enabled_path], check=True
+                    )
 
-                    # Test and reload nginx
-                    test_result = subprocess.run(["nginx", "-t"], capture_output=True)
+                    app.logger.info("Nginx config created and enabled")
+
+                    # Disable default site if it exists
+                    subprocess.run(
+                        ["sudo", "rm", "-f", "/etc/nginx/sites-enabled/default"],
+                        check=False,
+                    )
+                    app.logger.info("Disabled default nginx site")
+
+                    # Test nginx config
+                    test_result = subprocess.run(
+                        ["sudo", "nginx", "-t"], capture_output=True, text=True
+                    )
+
                     if test_result.returncode == 0:
-                        subprocess.run(["systemctl", "reload", "nginx"])
+                        subprocess.run(["sudo", "systemctl", "reload", "nginx"])
                         app.logger.info("✅ Nginx configured and reloaded")
                     else:
-                        app.logger.warning("Nginx config test failed")
+                        app.logger.error(
+                            f"Nginx config test failed: {test_result.stderr}"
+                        )
 
                 except Exception as nginx_error:
-                    app.logger.warning(f"Could not configure nginx: {nginx_error}")
+                    app.logger.error(f"Could not configure nginx: {nginx_error}")
+                    import traceback
+
+                    traceback.print_exc()
 
             # ═══════════════════════════════════════════════════════════
             # STEP 9: Save to database
