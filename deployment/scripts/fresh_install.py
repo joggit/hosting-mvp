@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
 Hosting Manager - Fresh Server Installation
-Fixed user creation and SSH key setup
+Complete version with all fixes:
+- Proper user creation with home directory
+- SSH key setup
+- Node.js PATH configuration
+- Firewall with app ports
+- PM2 fork mode fixes
 """
 
 import argparse
@@ -10,61 +15,69 @@ import sys
 import time
 from pathlib import Path
 
+
 class Colors:
-    GREEN = '\033[0;32m'
-    RED = '\033[0;31m'
-    YELLOW = '\033[1;33m'
-    BLUE = '\033[0;34m'
-    CYAN = '\033[0;36m'
-    NC = '\033[0m'
+    GREEN = "\033[0;32m"
+    RED = "\033[0;31m"
+    YELLOW = "\033[1;33m"
+    BLUE = "\033[0;34m"
+    CYAN = "\033[0;36m"
+    NC = "\033[0m"
+
 
 def print_step(message):
     print(f"{Colors.GREEN}▶ {message}{Colors.NC}")
 
+
 def print_success(message):
     print(f"{Colors.GREEN}✅ {message}{Colors.NC}")
+
 
 def print_error(message):
     print(f"{Colors.RED}❌ {message}{Colors.NC}")
 
+
 def print_warning(message):
     print(f"{Colors.YELLOW}⚠️  {message}{Colors.NC}")
+
 
 def print_header(message):
     print(f"\n{Colors.BLUE}{'='*60}{Colors.NC}")
     print(f"{Colors.BLUE}{message}{Colors.NC}")
     print(f"{Colors.BLUE}{'='*60}{Colors.NC}\n")
 
+
 class FreshInstaller:
-    """Handles fresh server installation with proper user setup"""
-    
+    """Handles fresh server installation with all fixes applied"""
+
     def __init__(self, server, username, repo_url, root_password=None):
         self.server = server
         self.username = username
         self.repo_url = repo_url
         self.root_password = root_password
-        
-        # Get local SSH public key
         self.ssh_public_key = self.get_ssh_public_key()
-    
+
     def get_ssh_public_key(self):
         """Get the local SSH public key"""
-        ssh_key_path = Path.home() / '.ssh' / 'id_ed25519.pub'
+        ssh_key_path = Path.home() / ".ssh" / "id_ed25519.pub"
         if not ssh_key_path.exists():
-            ssh_key_path = Path.home() / '.ssh' / 'id_rsa.pub'
-        
+            ssh_key_path = Path.home() / ".ssh" / "id_rsa.pub"
+
         if not ssh_key_path.exists():
             print_warning("No SSH key found. Generating new key...")
-            subprocess.run("ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519", shell=True, check=True)
-            ssh_key_path = Path.home() / '.ssh' / 'id_ed25519.pub'
-        
+            subprocess.run(
+                "ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519",
+                shell=True,
+                check=True,
+            )
+            ssh_key_path = Path.home() / ".ssh" / "id_ed25519.pub"
+
         return ssh_key_path.read_text().strip()
-    
+
     def build_installation_script(self):
-        """Build the complete installation script with proper user setup"""
-        # Escape single quotes in SSH key for shell
+        """Build the complete installation script"""
         ssh_key_escaped = self.ssh_public_key.replace("'", "'\"'\"'")
-        
+
         return f"""
 set -e  # Exit on any error
 
@@ -87,16 +100,15 @@ echo "✅ System updated"
 # ═══════════════════════════════════════════════════════════
 echo "[2/10] Setting up user {self.username}..."
 
-# Check if user exists
 if id "{self.username}" &>/dev/null; then
     echo "User {self.username} already exists"
-    # Ensure home directory exists
     if [ ! -d "/home/{self.username}" ]; then
         echo "Creating home directory..."
-        mkhomedir_helper {self.username}
+        mkhomedir_helper {self.username} 2>/dev/null || mkdir -p /home/{self.username}
+        chown {self.username}:{self.username} /home/{self.username}
+        chmod 755 /home/{self.username}
     fi
 else
-    # Create user with home directory
     echo "Creating user {self.username}..."
     useradd -m -s /bin/bash {self.username}
     echo "User created with home directory"
@@ -113,9 +125,6 @@ if [ ! -d "/home/{self.username}" ]; then
     exit 1
 fi
 
-echo "User info:"
-id {self.username}
-ls -la /home/{self.username}
 echo "✅ User {self.username} ready"
 
 # ═══════════════════════════════════════════════════════════
@@ -123,27 +132,24 @@ echo "✅ User {self.username} ready"
 # ═══════════════════════════════════════════════════════════
 echo "[3/10] Setting up SSH keys..."
 
-# Create .ssh directory
 mkdir -p /home/{self.username}/.ssh
 chmod 700 /home/{self.username}/.ssh
 
 # Add YOUR SSH public key (from local machine)
 echo '{ssh_key_escaped}' > /home/{self.username}/.ssh/authorized_keys
 
-# Also copy root's keys if they exist (for backwards compatibility)
+# Also copy root's keys if they exist
 if [ -f /root/.ssh/authorized_keys ]; then
     cat /root/.ssh/authorized_keys >> /home/{self.username}/.ssh/authorized_keys
 fi
+
+# Remove duplicates
+sort -u /home/{self.username}/.ssh/authorized_keys -o /home/{self.username}/.ssh/authorized_keys
 
 # Set proper permissions
 chmod 600 /home/{self.username}/.ssh/authorized_keys
 chown -R {self.username}:{self.username} /home/{self.username}/.ssh
 
-# Verify
-echo "SSH directory contents:"
-ls -la /home/{self.username}/.ssh/
-echo "Authorized keys:"
-wc -l /home/{self.username}/.ssh/authorized_keys
 echo "✅ SSH keys configured"
 
 # ═══════════════════════════════════════════════════════════
@@ -156,6 +162,7 @@ ufw allow 22/tcp
 ufw allow 80/tcp
 ufw allow 443/tcp
 ufw allow 5000/tcp
+ufw allow 3000:4000/tcp  # Ports for deployed apps
 echo "✅ Firewall configured"
 
 # ═══════════════════════════════════════════════════════════
@@ -177,7 +184,7 @@ systemctl restart fail2ban
 echo "✅ Fail2ban configured"
 
 # ═══════════════════════════════════════════════════════════
-# STEP 6: Install Node.js Ecosystem
+# STEP 6: Install Node.js Ecosystem (WITH PATH FIXES)
 # ═══════════════════════════════════════════════════════════
 echo "[6/10] Installing Node.js ecosystem..."
 curl -fsSL https://deb.nodesource.com/setup_20.x | bash - 2>&1 | grep -v "^#" || true
@@ -186,18 +193,33 @@ apt-get install -y nodejs
 # Install PM2 and pnpm globally
 npm install -g pm2 pnpm 2>&1 | grep -v "npm WARN" || true
 
+# CRITICAL: Make Node.js tools accessible system-wide
+echo "Setting up Node.js tool paths..."
+ln -sf /usr/bin/node /usr/local/bin/node || true
+ln -sf /usr/bin/npm /usr/local/bin/npm || true
+ln -sf /usr/lib/node_modules/pm2/bin/pm2 /usr/local/bin/pm2 || true
+ln -sf /usr/bin/pnpm /usr/local/bin/pnpm || true
+
+# Add to deploy user's PATH
+echo 'export PATH="/usr/local/bin:/usr/bin:$PATH"' >> /home/{self.username}/.bashrc
+chown {self.username}:{self.username} /home/{self.username}/.bashrc
+
 # Setup PM2 startup for deploy user
-echo "Setting up PM2 for user {self.username}..."
-su - {self.username} -c "pm2 startup" | tail -1 > /tmp/pm2_startup_cmd.sh
+echo "Setting up PM2 startup..."
+su - {self.username} -c "pm2 startup" 2>&1 | tail -1 > /tmp/pm2_startup_cmd.sh || true
 if [ -s /tmp/pm2_startup_cmd.sh ]; then
-    bash /tmp/pm2_startup_cmd.sh
+    bash /tmp/pm2_startup_cmd.sh 2>&1
     rm /tmp/pm2_startup_cmd.sh
 fi
 
+# Verify installations
 echo "Node.js: $(node --version)"
 echo "npm: $(npm --version)"
 echo "PM2: $(pm2 --version)"
 echo "pnpm: $(pnpm --version)"
+
+# Verify as deploy user
+su - {self.username} -c "node --version && npm --version && pm2 --version && pnpm --version" && echo "✅ Deploy user can access all Node.js tools"
 echo "✅ Node.js ecosystem installed"
 
 # ═══════════════════════════════════════════════════════════
@@ -245,7 +267,7 @@ User={self.username}
 Group={self.username}
 WorkingDirectory=/opt/hosting-manager
 Environment="PYTHONUNBUFFERED=1"
-Environment="PATH=/usr/bin:/usr/local/bin"
+Environment="PATH=/usr/local/bin:/usr/bin"
 ExecStart=/usr/bin/python3 /opt/hosting-manager/app.py
 Restart=always
 RestartSec=3
@@ -320,7 +342,7 @@ nginx -t 2>&1 && systemctl reload nginx
 echo "✅ Nginx configured"
 
 # ═══════════════════════════════════════════════════════════
-# STEP 10: Verify Installation & Test SSH
+# STEP 10: Verify Installation
 # ═══════════════════════════════════════════════════════════
 echo "[10/10] Verifying installation..."
 
@@ -337,13 +359,11 @@ sleep 2
 if curl -f http://localhost:5000/api/health 2>/dev/null; then
     echo "✅ API is responding"
 else
-    echo "⚠️  API not responding yet (may need more time)"
+    echo "⚠️  API not responding yet"
 fi
 
-# Test SSH login for deploy user
-echo ""
-echo "Testing SSH access for {self.username} user..."
-su - {self.username} -c "echo 'SSH access works!'" && echo "✅ Deploy user can login"
+# Test SSH and tools as deploy user
+su - {self.username} -c "echo 'SSH works' && pm2 list" && echo "✅ Deploy user can login and use PM2"
 
 echo ""
 echo "============================================"
@@ -357,7 +377,7 @@ echo "  ✓ PM2 $(pm2 --version)"
 echo "  ✓ pnpm $(pnpm --version)"
 echo "  ✓ Python 3 + Flask"
 echo "  ✓ Nginx with virtual hosting"
-echo "  ✓ UFW Firewall"
+echo "  ✓ UFW Firewall (ports 22, 80, 443, 5000, 3000-4000)"
 echo "  ✓ Fail2ban"
 echo ""
 echo "📡 Server Access:"
@@ -370,10 +390,8 @@ echo "  Status:  ssh {self.username}@{self.server} 'sudo systemctl status hostin
 echo "  Logs:    ssh {self.username}@{self.server} 'sudo journalctl -u hosting-manager -f'"
 echo "  PM2:     ssh {self.username}@{self.server} 'pm2 list'"
 echo ""
-echo "✅ You should now be able to: ssh {self.username}@{self.server}"
-echo ""
 """
-    
+
     def install(self):
         """Run installation via single SSH session"""
         print_header("🚀 Fresh Server Installation - Hosting Manager")
@@ -382,30 +400,29 @@ echo ""
         print(f"Repository: {self.repo_url}")
         print(f"SSH Key:    {self.ssh_public_key[:50]}...")
         print()
-        
+
         # Check prerequisites
         if self.root_password:
-            result = subprocess.run('which sshpass', shell=True, capture_output=True)
+            result = subprocess.run("which sshpass", shell=True, capture_output=True)
             if result.returncode != 0:
                 print_error("sshpass is not installed")
-                print("Install it with: sudo apt-get install sshpass (Linux) or brew install hudochenkov/sshpass/sshpass (Mac)")
+                print("Install it with:")
+                print("  Linux: sudo apt-get install sshpass")
+                print("  Mac:   brew install hudochenkov/sshpass/sshpass")
                 sys.exit(1)
-        
-        # Build the installation script
+
         install_script = self.build_installation_script()
-        
+
         print_step("Connecting to server and starting installation...")
         print_warning("This will take several minutes. Please be patient...")
         print()
-        
-        # Execute via SSH
+
         try:
             if self.root_password:
                 ssh_cmd = f"sshpass -p '{self.root_password}' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@{self.server} 'bash -s'"
             else:
                 ssh_cmd = f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@{self.server} 'bash -s'"
-            
-            # Run the installation
+
             process = subprocess.Popen(
                 ssh_cmd,
                 shell=True,
@@ -413,58 +430,55 @@ echo ""
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                bufsize=1
+                bufsize=1,
             )
-            
-            # Send the script
+
             process.stdin.write(install_script)
             process.stdin.close()
-            
+
             # Show output in real-time
             for line in process.stdout:
-                print(line, end='')
-            
-            # Wait for completion
+                print(line, end="")
+
             return_code = process.wait()
-            
+
             if return_code != 0:
                 print_error(f"Installation failed with exit code {return_code}")
                 sys.exit(1)
-            
+
             print()
             print_header("✅ Installation Successful!")
-            
-            # Test SSH connection as deploy user
+
+            # Test SSH connection
             print_step(f"Testing SSH connection as {self.username} user...")
             time.sleep(2)
-            
+
             test_result = subprocess.run(
-                f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 {self.username}@{self.server} 'echo SSH works'",
+                f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 {self.username}@{self.server} 'pm2 --version'",
                 shell=True,
                 capture_output=True,
-                text=True
+                text=True,
             )
-            
+
             if test_result.returncode == 0:
-                print_success(f"✅ Can SSH as {self.username} user!")
+                print_success(f"✅ Can SSH as {self.username} and PM2 works!")
+                print(f"   PM2 version: {test_result.stdout.strip()}")
             else:
-                print_error(f"❌ Cannot SSH as {self.username} user")
-                print(f"Error: {test_result.stderr}")
-                print_warning("Try: ssh -v {self.username}@{self.server}")
-            
+                print_warning(f"⚠️  PM2 not accessible yet")
+
             # Test API
             print_step("Testing API from your local machine...")
             time.sleep(2)
-            
+
             try:
                 result = subprocess.run(
                     f"curl -f http://{self.server}/api/health",
                     shell=True,
                     capture_output=True,
                     text=True,
-                    timeout=10
+                    timeout=10,
                 )
-                
+
                 if result.returncode == 0:
                     print_success("✅ API is accessible!")
                     print(f"\n{result.stdout}\n")
@@ -472,10 +486,9 @@ echo ""
                     print_warning("⚠️  API not accessible yet")
             except:
                 print_warning("⚠️  Could not test API")
-            
-            # Print final summary
+
             self.print_final_summary()
-            
+
         except KeyboardInterrupt:
             print()
             print_error("Installation interrupted by user")
@@ -483,55 +496,73 @@ echo ""
         except Exception as e:
             print_error(f"Installation failed: {e}")
             import traceback
+
             traceback.print_exc()
             sys.exit(1)
-    
+
     def print_final_summary(self):
         """Print final summary"""
         print(f"{Colors.BLUE}{'='*60}{Colors.NC}")
         print(f"{Colors.CYAN}📚 Next Steps:{Colors.NC}\n")
         print(f"1. Test SSH access:")
         print(f"   ssh {self.username}@{self.server}\n")
-        print(f"2. Test API:")
+        print(f"2. Test PM2:")
+        print(f"   ssh {self.username}@{self.server} 'pm2 list'\n")
+        print(f"3. Test API:")
         print(f"   curl http://{self.server}/api/health\n")
-        print(f"3. Deploy your first app:")
-        print(f"   Use the /api/deploy/nodejs endpoint\n")
-        print(f"4. Monitor with PM2:")
-        print(f"   ssh {self.username}@{self.server}")
-        print(f"   pm2 list\n")
-        print(f"{Colors.BLUE}{'='*60}{Colors.NC}")
+        print(f"4. Deploy your first app:")
+        print(f"   curl -X POST http://{self.server}:5000/api/deploy/nodejs \\\n")
+        print(f"     -H 'Content-Type: application/json' \\\n")
+        print(f'     -d \'{{"name":"test-app", "files":{{...}}}}\'')
+        print(f"\n5. View deployment guide:")
+        print(f"   See API documentation for deployment examples")
+        print(f"\n{Colors.BLUE}{'='*60}{Colors.NC}")
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Fresh server installation for Hosting Manager',
+        description="Fresh server installation for Hosting Manager",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # With root password
+  # With root password (requires sshpass)
   python3 fresh_install.py --server 75.119.141.162 --user deploy \\
     --repo https://github.com/joggit/hosting-mvp.git --root-password PASSWORD
   
-  # With SSH key
+  # With SSH key (recommended)
   python3 fresh_install.py --server 75.119.141.162 --user deploy \\
     --repo https://github.com/joggit/hosting-mvp.git
-        """
+
+What gets installed:
+  ✓ Node.js 20.x LTS + npm
+  ✓ PM2 (Process Manager)
+  ✓ pnpm (Package Manager)
+  ✓ Python 3 + Flask
+  ✓ Nginx (Web Server)
+  ✓ SQLite (Database)
+  ✓ UFW Firewall (ports: 22, 80, 443, 5000, 3000-4000)
+  ✓ Fail2ban (Security)
+        """,
     )
-    
-    parser.add_argument('--server', required=True, help='Server IP address')
-    parser.add_argument('--user', required=True, help='Username to create')
-    parser.add_argument('--repo', required=True, help='Git repository URL')
-    parser.add_argument('--root-password', help='Root password')
-    
+
+    parser.add_argument("--server", required=True, help="Server IP address or hostname")
+    parser.add_argument(
+        "--user", required=True, help="Username to create (e.g., deploy)"
+    )
+    parser.add_argument("--repo", required=True, help="Git repository URL")
+    parser.add_argument("--root-password", help="Root password (if not using SSH key)")
+
     args = parser.parse_args()
-    
+
     installer = FreshInstaller(
         server=args.server,
         username=args.user,
         repo_url=args.repo,
-        root_password=args.root_password
+        root_password=args.root_password,
     )
-    
+
     installer.install()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
