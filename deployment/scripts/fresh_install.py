@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Hosting Manager - Fresh Server Installation
-Includes: Node.js, PM2, Python, Nginx, Docker, Docker Compose, WordPress directories
+FIXED: Cleanup Docker repos BEFORE first apt-get update
 """
 
 import argparse
@@ -47,7 +47,6 @@ class FreshInstaller:
     """Handles fresh server installation with all fixes applied"""
 
     def __init__(self, server, username, repo_url, root_password=None):
-        # Check if running as root (BAD!)
         if os.geteuid() == 0:
             print_error("DO NOT run this script with sudo!")
             print_error("Run as your regular user:")
@@ -62,7 +61,6 @@ class FreshInstaller:
 
     def get_ssh_public_key(self):
         """Get the local SSH public key - ALWAYS from actual user's home"""
-        # Get the real user's home directory (even if using sudo - which we prevent)
         real_user = os.environ.get("SUDO_USER") or os.environ.get("USER")
         if real_user == "root":
             print_warning("Running as root user. Using /root/.ssh/")
@@ -102,21 +100,28 @@ class FreshInstaller:
         key = ssh_key_path.read_text().strip()
         print_success(f"Using SSH key: {ssh_key_path}")
         print(f"  Key: {key[:60]}...")
-        print(f"  Full key: {key}")
         return key
 
     def build_installation_script(self):
         """Build the complete installation script"""
-        # Properly escape the SSH key for shell
         ssh_key_escaped = self.ssh_public_key.replace("'", "'\"'\"'")
 
-        return f"""
+        return rf"""
 set -e  # Exit on any error
 
 echo "============================================"
 echo "Starting Hosting Manager Installation"
 echo "============================================"
 echo ""
+
+# ═══════════════════════════════════════════════════════════
+# STEP 0: Cleanup (CRITICAL - BEFORE apt-get update)
+# ═══════════════════════════════════════════════════════════
+echo "[0/12] Cleaning up old configurations..."
+rm -f /etc/apt/sources.list.d/docker.list
+rm -f /etc/apt/sources.list.d/docker.list.save
+rm -f /etc/apt/keyrings/docker.gpg
+echo "✅ Cleanup complete"
 
 # ═══════════════════════════════════════════════════════════
 # STEP 1: Update System
@@ -250,27 +255,31 @@ systemctl restart fail2ban 2>/dev/null || true
 echo "✅ Fail2ban configured (relaxed for development)"
 
 # ═══════════════════════════════════════════════════════════
-# STEP 7: Install Docker & Docker Compose
+# STEP 7: Install Docker & Docker Compose (FIXED)
 # ═══════════════════════════════════════════════════════════
 echo "[7/12] Installing Docker & Docker Compose..."
 
-# Install Docker
 if ! command -v docker &> /dev/null; then
+    echo "Installing Docker from official repository..."
+    
     # Add Docker's official GPG key
     install -m 0755 -d /etc/apt/keyrings
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
     chmod a+r /etc/apt/keyrings/docker.gpg
 
-    # Add Docker repository
-    echo \
-      "deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-      \$(. /etc/os-release && echo "\$VERSION_CODENAME") stable" | \
-      tee /etc/apt/sources.list.d/docker.list > /dev/null
-
+    # Get system info
+    ARCH=$(dpkg --print-architecture)
+    CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
+    
+    # Create Docker repository configuration (FIXED: single line)
+    echo "deb [arch=$ARCH signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $CODENAME stable" > /etc/apt/sources.list.d/docker.list
+    
+    echo "Repository configured for $CODENAME ($ARCH)"
+    
     # Install Docker Engine
     apt-get update -qq
     apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
+    
     echo "✅ Docker installed"
 else
     echo "✅ Docker already installed"
@@ -280,9 +289,12 @@ fi
 usermod -aG docker {self.username}
 echo "✅ User {self.username} added to docker group"
 
-# Install docker-compose (standalone) if not present
+# Install docker-compose (standalone)
 if ! command -v docker-compose &> /dev/null; then
-    curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-\$(uname -s)-\$(uname -m)" -o /usr/local/bin/docker-compose
+    echo "Installing docker-compose standalone..."
+    COMPOSE_OS=$(uname -s)
+    COMPOSE_ARCH=$(uname -m)
+    curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$COMPOSE_OS-$COMPOSE_ARCH" -o /usr/local/bin/docker-compose
     chmod +x /usr/local/bin/docker-compose
     echo "✅ Docker Compose installed"
 else
@@ -293,8 +305,8 @@ fi
 systemctl start docker
 systemctl enable docker
 
-echo "Docker version: \$(docker --version)"
-echo "Docker Compose version: \$(docker-compose --version)"
+echo "Docker version: $(docker --version)"
+echo "Docker Compose version: $(docker-compose --version)"
 echo "✅ Docker & Docker Compose ready"
 
 # ═══════════════════════════════════════════════════════════
@@ -323,8 +335,8 @@ if [ -s /tmp/pm2_startup_cmd.sh ]; then
     rm /tmp/pm2_startup_cmd.sh
 fi
 
-echo "Node.js: \$(node --version)"
-echo "PM2: \$(pm2 --version)"
+echo "Node.js: $(node --version)"
+echo "PM2: $(pm2 --version)"
 echo "✅ Node.js ecosystem installed"
 
 # ═══════════════════════════════════════════════════════════
@@ -358,8 +370,6 @@ echo "   - /var/log/hosting-manager (logs)"
 echo "   - /var/www/domains (Next.js apps)"
 echo "   - /var/www/wordpress-sites (WordPress sites)"
 
-# In the build_installation_script method, STEP 11:
-
 # ═══════════════════════════════════════════════════════════
 # STEP 11: Deploy Application
 # ═══════════════════════════════════════════════════════════
@@ -376,8 +386,6 @@ fi
 
 cd /opt/hosting-manager
 pip3 install --break-system-packages -r requirements.txt 2>&1 | grep -v "WARNING" || true
-
-# ⭐ NO MORE MIGRATION STEP - Tables auto-create on app startup
 
 # Create systemd service
 cat > /etc/systemd/system/hosting-manager.service << 'SERVICE'
@@ -407,6 +415,7 @@ systemctl restart hosting-manager
 sleep 5
 
 echo "✅ Application deployed"
+
 # ═══════════════════════════════════════════════════════════
 # STEP 12: Configure Nginx
 # ═══════════════════════════════════════════════════════════
@@ -452,6 +461,9 @@ echo ""
 echo "Checking hosting-manager service..."
 systemctl is-active hosting-manager && echo "✅ hosting-manager service is running" || echo "❌ Service not running"
 
+# Test Docker access
+su - {self.username} -c "docker ps" > /dev/null 2>&1 && echo "✅ Docker access verified" || echo "⚠️  Docker group needs logout/login"
+
 echo ""
 echo "============================================"
 echo "✅ Installation Complete!"
@@ -468,15 +480,9 @@ echo ""
 echo "Test API:"
 echo "  curl http://{self.server}:5000/api/health"
 echo ""
-# Test Docker access
-echo ""
-echo "Testing Docker access for {self.username}..."
-su - {self.username} -c "docker ps" && echo "✅ {self.username} can use Docker without sudo" || echo "⚠️  Docker permissions need session refresh"
-
-# Note about docker group
-echo ""
-echo "⚠️  Note: {self.username} needs to log out and back in for Docker group to take effect"
+echo "⚠️  Note: {self.username} needs to log out and back in for Docker group"
 echo "   Or run: newgrp docker"
+echo ""
 """
 
     def install(self):
@@ -557,9 +563,9 @@ echo "   Or run: newgrp docker"
 def main():
     parser = argparse.ArgumentParser(
         description="Fresh server installation with Docker & WordPress support",
-        epilog="Note: This script should be run as your regular user, not with sudo!",
+        epilog="Example: python3 fresh_install.py --server 75.119.141.162 --user deploy --repo https://github.com/user/repo.git",
     )
-    parser.add_argument("--server", required=True, help="Server IP")
+    parser.add_argument("--server", required=True, help="Server IP address")
     parser.add_argument("--user", required=True, help="Username to create")
     parser.add_argument("--repo", required=True, help="Git repository URL")
     parser.add_argument("--root-password", help="Root password (optional)")

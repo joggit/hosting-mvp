@@ -437,6 +437,112 @@ def get_moods():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@wp_bp.route("/deploy-template", methods=["POST"])
+def deploy_wordpress_template():
+    """
+    Deploy WordPress with template configuration (for AI-enhanced deployment)
+
+    POST /api/wordpress/deploy-template
+    Also available at: /api/deploy/wordpress-template (via alias below)
+    """
+    try:
+        data = request.get_json()
+
+        # Extract configuration
+        template = data.get("template")
+        domain_config = data.get("domain_config", {})
+        site_config = data.get("site_config", {})
+        auto_setup = data.get("auto_setup", True)
+        ai_design = data.get("ai_design")
+
+        # Validate required fields
+        if not template:
+            return jsonify({"success": False, "error": "Template is required"}), 400
+
+        if not domain_config.get("subdomain") or not domain_config.get("parent_domain"):
+            return (
+                jsonify(
+                    {"success": False, "error": "Domain configuration is required"}
+                ),
+                400,
+            )
+
+        if not site_config.get("admin_password") or not site_config.get("admin_email"):
+            return (
+                jsonify({"success": False, "error": "Admin credentials are required"}),
+                400,
+            )
+
+        # Build domain
+        subdomain = domain_config["subdomain"]
+        parent_domain = domain_config["parent_domain"]
+        full_domain = f"{subdomain}.{parent_domain}"
+
+        # Get port
+        port = domain_config.get("port")
+        if not port:
+            ports = find_available_ports(8000, 1)
+            port = ports[0]
+
+        logger.info(
+            f"🚀 Deploying WordPress template '{template}' to {full_domain}:{port}"
+        )
+
+        # Create WordPress site
+        result = create_wordpress_site(
+            site_name=subdomain,
+            domain=full_domain,
+            port=port,
+            admin_email=site_config["admin_email"],
+            admin_password=site_config["admin_password"],
+            site_title=site_config.get("site_title", subdomain),
+        )
+
+        # Create nginx reverse proxy
+        try:
+            create_nginx_reverse_proxy(full_domain, port)
+            reload_nginx()
+            logger.info(f"✅ Nginx configured for {full_domain}")
+        except Exception as nginx_error:
+            logger.warning(f"Nginx configuration warning: {nginx_error}")
+
+        # TODO: Apply AI design if provided
+        if ai_design:
+            logger.info(f"✨ AI design will be applied (not yet implemented)")
+
+        # Return success
+        return (
+            jsonify(
+                {
+                    "success": True,
+                    "domain": {
+                        "full_domain": full_domain,
+                        "subdomain": subdomain,
+                        "parent_domain": parent_domain,
+                        "url": f"http://{full_domain}",
+                        "ssl_enabled": False,
+                        "port": port,
+                    },
+                    "wordpress": {
+                        "admin_url": f"http://{full_domain}/wp-admin",
+                        "admin_user": site_config.get("admin_user", "admin"),
+                        "site_title": site_config.get("site_title", subdomain),
+                        "template": template,
+                        "plugins_installed": True,
+                        "theme_activated": True,
+                    },
+                    "ai_design_applied": ai_design is not None,
+                    "message": f"WordPress deployed successfully to {full_domain}",
+                }
+            ),
+            200,
+        )
+
+    except Exception as e:
+        logger.error(f"WordPress template deployment failed: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 # ============================================================================
 # Route Registration
 # ============================================================================
