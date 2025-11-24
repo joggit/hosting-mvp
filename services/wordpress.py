@@ -9,6 +9,8 @@ import json
 import logging
 import secrets
 import string
+import time
+import requests
 from pathlib import Path
 from services.database import get_db
 
@@ -17,10 +19,145 @@ logger = logging.getLogger(__name__)
 WORDPRESS_BASE_DIR = "/var/www/wordpress-sites"
 
 
+# ============================================================================
+# Helper Functions for Container Readiness
+# ============================================================================
+
+
+def wait_for_container_ready(site_name, max_wait=60):
+    """Wait for WordPress container to be fully running"""
+    logger.info(f"Waiting for container {site_name}_wordpress to be ready...")
+    start_time = time.time()
+
+    while (time.time() - start_time) < max_wait:
+        try:
+            result = subprocess.run(
+                [
+                    "docker",
+                    "ps",
+                    "--filter",
+                    f"name={site_name}_wordpress",
+                    "--format",
+                    "{{.Status}}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+
+            status = result.stdout.strip()
+            if "Up" in status:
+                logger.info(f"✅ Container is running: {status}")
+                return True
+
+            logger.debug(f"Container status: {status or 'not running'}")
+        except Exception as e:
+            logger.debug(f"Container check error: {e}")
+
+        time.sleep(2)
+
+    logger.error(f"❌ Container did not start within {max_wait} seconds")
+    return False
+
+
+def wait_for_wordpress_ready(port, max_wait=90):
+    """Wait for WordPress to respond to HTTP requests"""
+    logger.info(f"Waiting for WordPress at http://localhost:{port} to respond...")
+    start_time = time.time()
+    url = f"http://localhost:{port}"
+
+    while (time.time() - start_time) < max_wait:
+        try:
+            response = requests.get(url, timeout=5)
+            if response.status_code in [200, 302, 500]:
+                logger.info(
+                    f"✅ WordPress is responding (status: {response.status_code})"
+                )
+                return True
+        except requests.exceptions.RequestException as e:
+            logger.debug(f"WordPress not ready yet: {e}")
+
+        time.sleep(3)
+
+    logger.error(f"❌ WordPress did not respond within {max_wait} seconds")
+    return False
+
+
+def install_wordpress_with_retry(
+    site_name, site_title, admin_user, admin_password, admin_email, url, max_retries=3
+):
+    """Install WordPress with retry logic"""
+    cli_container = f"{site_name}_cli"
+
+    for attempt in range(max_retries):
+        try:
+            logger.info(
+                f"Installing WordPress (attempt {attempt + 1}/{max_retries})..."
+            )
+
+            install_cmd = [
+                "docker",
+                "exec",
+                cli_container,
+                "wp",
+                "core",
+                "install",
+                f"--url={url}",
+                f"--title={site_title}",
+                f"--admin_user={admin_user}",
+                f"--admin_password={admin_password}",
+                f"--admin_email={admin_email}",
+                "--skip-email",
+            ]
+
+            result = subprocess.run(
+                install_cmd, capture_output=True, text=True, timeout=60
+            )
+
+            if result.returncode == 0:
+                logger.info(f"✅ WordPress installed successfully")
+                logger.info(f"Output: {result.stdout}")
+                return True
+            else:
+                logger.warning(f"Install attempt {attempt + 1} failed: {result.stderr}")
+
+                # If already installed, that's OK
+                if "already installed" in result.stderr.lower():
+                    logger.info("✅ WordPress already installed")
+                    return True
+
+                # Wait before retry
+                if attempt < max_retries - 1:
+                    logger.info(f"Waiting 5 seconds before retry...")
+                    time.sleep(5)
+
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Install attempt {attempt + 1} timed out")
+            if attempt < max_retries - 1:
+                time.sleep(5)
+        except Exception as e:
+            logger.error(f"Install attempt {attempt + 1} error: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(5)
+
+    logger.error("❌ WordPress installation failed after all retries")
+    return False
+
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+
 def generate_password(length=20):
     """Generate secure random password"""
     alphabet = string.ascii_letters + string.digits + "!@#$%^&*()"
     return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+# ============================================================================
+# WordPress Site Management
+# ============================================================================
 
 
 def create_wordpress_site(
@@ -135,46 +272,39 @@ networks:
         logger.error(f"Failed to start containers: {e.stderr}")
         raise Exception(f"Docker Compose failed: {e.stderr}")
 
-    # Wait for WordPress to be ready
-    logger.info("Waiting for WordPress to initialize...")
-    import time
+    # ============================================================================
+    # Wait for containers and install WordPress
+    # ============================================================================
 
-    time.sleep(15)
+    # Wait for container to be running
+    logger.info("Waiting for containers to be ready...")
+    if not wait_for_container_ready(site_name, max_wait=60):
+        raise Exception("WordPress container failed to start properly")
 
-    # Install WordPress with WP-CLI
-    logger.info("Installing WordPress...")
-    wp_install_cmd = [
-        "docker",
-        "exec",
-        cli_container,
-        "wp",
-        "core",
-        "install",
-        f"--url=http://{domain}",
-        f"--title={site_title}",
-        "--admin_user=admin",
-        f"--admin_password={admin_password}",
-        f"--admin_email={admin_email}",
-        "--skip-email",
-    ]
-
-    try:
-        result = subprocess.run(
-            wp_install_cmd, capture_output=True, text=True, timeout=60
+    # Wait for WordPress to respond to HTTP
+    if not wait_for_wordpress_ready(port, max_wait=90):
+        logger.warning(
+            "WordPress not responding to HTTP, but continuing with installation..."
         )
 
-        if result.returncode != 0:
-            logger.warning(f"WP install output: {result.stderr}")
-            # Try again after a short wait
-            time.sleep(5)
-            result = subprocess.run(
-                wp_install_cmd, capture_output=True, text=True, timeout=60
-            )
+    # Install WordPress with retry logic
+    logger.info("Installing WordPress...")
+    install_success = install_wordpress_with_retry(
+        site_name=site_name,
+        site_title=site_title,
+        admin_user="admin",
+        admin_password=admin_password,
+        admin_email=admin_email,
+        url=f"http://{domain}",
+        max_retries=3,
+    )
 
-        logger.info("✅ WordPress installed")
-    except Exception as e:
-        logger.error(f"WordPress installation error: {e}")
-        raise Exception(f"WordPress installation failed: {e}")
+    if not install_success:
+        raise Exception(
+            "WordPress installation failed - containers created but WordPress not configured"
+        )
+
+    logger.info("✅ WordPress installation complete")
 
     # Save to database
     conn = get_db()
