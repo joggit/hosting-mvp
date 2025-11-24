@@ -87,7 +87,8 @@ def install_wordpress_with_retry(
     site_name, site_title, admin_user, admin_password, admin_email, url, max_retries=3
 ):
     """Install WordPress with retry logic"""
-    cli_container = f"{site_name}_cli"
+    # Use the WordPress container directly (it has WP-CLI installed)
+    wp_container = f"{site_name}_wordpress"
 
     for attempt in range(max_retries):
         try:
@@ -98,7 +99,9 @@ def install_wordpress_with_retry(
             install_cmd = [
                 "docker",
                 "exec",
-                cli_container,
+                "--user",
+                "www-data",  # Run as www-data user
+                wp_container,
                 "wp",
                 "core",
                 "install",
@@ -108,6 +111,7 @@ def install_wordpress_with_retry(
                 f"--admin_password={admin_password}",
                 f"--admin_email={admin_email}",
                 "--skip-email",
+                "--allow-root",  # Allow running as root if www-data doesn't work
             ]
 
             result = subprocess.run(
@@ -177,7 +181,6 @@ def create_wordpress_site(
     # Container names
     wp_container = f"{site_name}_wordpress"
     mysql_container = f"{site_name}_mysql"
-    cli_container = f"{site_name}_cli"
 
     # Create site directory
     site_dir = os.path.join(WORDPRESS_BASE_DIR, site_name)
@@ -224,22 +227,6 @@ services:
     networks:
       - wordpress_network
     command: '--default-authentication-plugin=mysql_native_password'
-
-  wp-cli:
-    image: wordpress:cli
-    container_name: {cli_container}
-    volumes:
-      - wordpress_data:/var/www/html
-    depends_on:
-      - wordpress
-      - mysql
-    networks:
-      - wordpress_network
-    environment:
-      WORDPRESS_DB_HOST: mysql
-      WORDPRESS_DB_USER: wordpress
-      WORDPRESS_DB_PASSWORD: {db_password}
-      WORDPRESS_DB_NAME: wordpress
 
 volumes:
   wordpress_data:
@@ -313,9 +300,9 @@ networks:
     cursor.execute(
         """
         INSERT INTO wordpress_sites 
-        (site_name, domain, port, container_name, mysql_container, cli_container, 
+        (site_name, domain, port, container_name, mysql_container, 
          admin_email, docker_compose_path, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running')
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'running')
     """,
         (
             site_name,
@@ -323,7 +310,6 @@ networks:
             port,
             wp_container,
             mysql_container,
-            cli_container,
             admin_email,
             compose_path,
         ),
@@ -354,7 +340,6 @@ networks:
         "containers": {
             "wordpress": wp_container,
             "mysql": mysql_container,
-            "cli": cli_container,
         },
     }
 
@@ -367,7 +352,7 @@ def execute_wp_cli(site_name, command):
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT cli_container, id FROM wordpress_sites WHERE site_name = ?",
+        "SELECT container_name, id FROM wordpress_sites WHERE site_name = ?",
         (site_name,),
     )
     result = cursor.fetchone()
@@ -376,12 +361,13 @@ def execute_wp_cli(site_name, command):
         conn.close()
         raise Exception(f"WordPress site not found: {site_name}")
 
-    cli_container, site_id = result
+    wp_container, site_id = result
 
     # Execute command
     try:
         result = subprocess.run(
-            ["docker", "exec", cli_container, "wp"] + command.split(),
+            ["docker", "exec", "--user", "www-data", wp_container, "wp"]
+            + command.split(),
             capture_output=True,
             text=True,
             timeout=120,
