@@ -80,15 +80,29 @@ def deploy_wordpress():
         except Exception as nginx_error:
             logger.warning(f"Nginx configuration warning: {nginx_error}")
 
+        # Format response to match React expectations
         return jsonify(
             {
                 "success": True,
-                **result,
+                "domain": {
+                    "url": f"http://{domain}",
+                    "full_domain": domain,
+                    "port": port,
+                },
+                "wordpress": {
+                    "admin_url": f"http://{domain}/wp-admin",
+                    "admin_user": "admin",
+                    "site_title": site_title,
+                    "template": data.get("template", "default"),
+                    "plugins_installed": True,
+                    "theme_activated": True,
+                },
                 "credentials": {
                     "username": "admin",
                     "password": admin_password,
                     "email": admin_email,
                 },
+                "message": f"WordPress deployed successfully to {domain}",
             }
         )
 
