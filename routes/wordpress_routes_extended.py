@@ -313,7 +313,7 @@ def deploy_woocommerce_site():
 
         # Import from existing wordpress routes
         from services.wordpress import create_wordpress_site
-        from services.nginx_manager import create_nginx_reverse_proxy, reload_nginx
+        from services.nginx_config import create_nginx_reverse_proxy, reload_nginx
         from utils.ports import find_available_ports
 
         # Validate required fields

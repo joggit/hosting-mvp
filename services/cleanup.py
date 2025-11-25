@@ -8,7 +8,7 @@ import subprocess
 import logging
 import shutil
 from services.database import get_db
-from services.nginx_manager import remove_nginx_site, reload_nginx
+from services.nginx_config import remove_nginx_site, reload_nginx
 
 logger = logging.getLogger(__name__)
 
