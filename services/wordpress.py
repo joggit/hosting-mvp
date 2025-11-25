@@ -321,6 +321,63 @@ networks:
 
     logger.info("✅ WordPress installation complete")
 
+    # Fix wp-content permissions for plugin installation
+    logger.info("Configuring wp-content permissions...")
+    try:
+        # Run comprehensive permission fix
+        subprocess.run(
+            [
+                "docker",
+                "exec",
+                wp_container,
+                "chown",
+                "-R",
+                "www-data:www-data",
+                "/var/www/html/wp-content",
+            ],
+            check=True,
+            timeout=30,
+        )
+        subprocess.run(
+            [
+                "docker",
+                "exec",
+                wp_container,
+                "find",
+                "/var/www/html/wp-content",
+                "-type",
+                "d",
+                "-exec",
+                "chmod",
+                "755",
+                "{}",
+                ";",
+            ],
+            check=True,
+            timeout=30,
+        )
+        subprocess.run(
+            [
+                "docker",
+                "exec",
+                wp_container,
+                "find",
+                "/var/www/html/wp-content",
+                "-type",
+                "f",
+                "-exec",
+                "chmod",
+                "644",
+                "{}",
+                ";",
+            ],
+            check=True,
+            timeout=30,
+        )
+        logger.info("✅ Permissions configured")
+    except Exception as e:
+        logger.warning(f"Permission setup warning: {e}")
+
     # Save to database
     conn = get_db()
     cursor = conn.cursor()
