@@ -85,6 +85,46 @@ def wait_for_wordpress_ready(port, max_wait=90):
     return False
 
 
+def wait_for_mysql_ready(mysql_container, max_wait=60):
+    """Wait for MySQL database to be ready to accept connections"""
+    logger.info(f"Waiting for MySQL database to be ready...")
+    start_time = time.time()
+
+    while (time.time() - start_time) < max_wait:
+        try:
+            # Check if MySQL is accepting connections
+            result = subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    mysql_container,
+                    "mysqladmin",
+                    "ping",
+                    "-h",
+                    "localhost",
+                    "--silent",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+
+            if result.returncode == 0:
+                logger.info(f"✅ MySQL is ready and accepting connections")
+                return True
+
+            logger.debug(f"MySQL not ready yet (exit code: {result.returncode})")
+        except subprocess.TimeoutExpired:
+            logger.debug("MySQL ping timed out")
+        except Exception as e:
+            logger.debug(f"MySQL check error: {e}")
+
+        time.sleep(2)
+
+    logger.error(f"❌ MySQL did not become ready within {max_wait} seconds")
+    return False
+
+
 def install_wordpress_with_retry(
     site_name, site_title, admin_user, admin_password, admin_email, url, max_retries=3
 ):
@@ -298,9 +338,14 @@ networks:
             "WordPress not responding to HTTP, but continuing with installation..."
         )
 
-    # Give database a moment to fully initialize
-    logger.info("Waiting for database initialization...")
-    time.sleep(10)
+    # Wait for MySQL database to be ready
+    logger.info("Waiting for MySQL database to initialize...")
+    if not wait_for_mysql_ready(mysql_container, max_wait=60):
+        logger.warning("MySQL not responding, attempting installation anyway...")
+    else:
+        # Give MySQL a moment to stabilize after accepting connections
+        logger.info("MySQL ready, waiting for stabilization...")
+        time.sleep(5)
 
     # Install WordPress with retry logic
     logger.info("Installing WordPress...")
