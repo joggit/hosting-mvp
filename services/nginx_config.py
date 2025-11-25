@@ -4,6 +4,7 @@ Nginx configuration management
 
 import subprocess
 import logging
+import os
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,22 @@ def create_nginx_reverse_proxy(domain, port):
         raise Exception(f"Nginx config test failed: {test_result.stderr}")
 
     logger.info(f"✅ Nginx config created for {domain}")
+
+
+def remove_nginx_site(domain):
+    """Remove nginx configuration for a domain"""
+    import subprocess
+
+    sites_available = f"/etc/nginx/sites-available/{domain}"
+    sites_enabled = f"/etc/nginx/sites-enabled/{domain}"
+
+    # Remove symlink
+    if os.path.exists(sites_enabled):
+        subprocess.run(["sudo", "rm", sites_enabled], check=True)
+
+    # Remove config file
+    if os.path.exists(sites_available):
+        subprocess.run(["sudo", "rm", sites_available], check=True)
 
 
 def reload_nginx():

@@ -12,6 +12,19 @@ from services.wordpress import (
     list_wordpress_sites,
     install_plugin,
 )
+
+from services.woocommerce import (
+    setup_woocommerce,
+    create_sample_products,
+    get_store_info,
+)
+from services.cleanup import (
+    list_sites_for_cleanup,
+    cleanup_wordpress_site,
+    cleanup_orphaned_containers,
+    get_docker_resources_usage,
+)
+
 from services.wordpress_ai_design import AIDesignService
 from services.port_checker import find_available_ports
 from services.nginx_config import create_nginx_reverse_proxy, reload_nginx
