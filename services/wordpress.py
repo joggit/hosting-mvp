@@ -244,8 +244,8 @@ services:
       WORDPRESS_DB_USER: wordpress
       WORDPRESS_DB_PASSWORD: {db_password}
       WORDPRESS_DB_NAME: wordpress
-    entrypoint: sh
-    command: -c "tail -f /dev/null"
+    entrypoint: ["sh"]
+    command: ["-c", "tail -f /dev/null"]
 
 volumes:
   wordpress_data:
