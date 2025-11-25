@@ -260,6 +260,288 @@ def install_wp_plugin(site_name):
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@wp_bp.route("/deploy-template", methods=["POST"])
+def deploy_wordpress_template():
+    """Deploy WordPress with template configuration"""
+    try:
+        data = request.get_json()
+
+        # Extract configuration
+        template = data.get("template")
+        domain_config = data.get("domain_config", {})
+        site_config = data.get("site_config", {})
+        auto_setup = data.get("auto_setup", True)
+        ai_design = data.get("ai_design")
+
+        # Validate required fields
+        if not template:
+            return jsonify({"success": False, "error": "Template is required"}), 400
+
+        if not domain_config.get("subdomain") or not domain_config.get("parent_domain"):
+            return (
+                jsonify(
+                    {"success": False, "error": "Domain configuration is required"}
+                ),
+                400,
+            )
+
+        if not site_config.get("admin_password") or not site_config.get("admin_email"):
+            return (
+                jsonify({"success": False, "error": "Admin credentials are required"}),
+                400,
+            )
+
+        # Build domain
+        subdomain = domain_config["subdomain"]
+        parent_domain = domain_config["parent_domain"]
+        full_domain = f"{subdomain}.{parent_domain}"
+
+        # Get port
+        port = domain_config.get("port")
+        if not port:
+            ports = find_available_ports(8000, 1)
+            port = ports[0]
+
+        logger.info(
+            f"🚀 Deploying WordPress template '{template}' to {full_domain}:{port}"
+        )
+
+        # Create WordPress site
+        result = create_wordpress_site(
+            site_name=subdomain,
+            domain=full_domain,
+            port=port,
+            admin_email=site_config["admin_email"],
+            admin_password=site_config["admin_password"],
+            site_title=site_config.get("site_title", subdomain),
+        )
+
+        # Create nginx reverse proxy
+        try:
+            create_nginx_reverse_proxy(full_domain, port)
+            reload_nginx()
+            logger.info(f"✅ Nginx configured for {full_domain}")
+        except Exception as nginx_error:
+            logger.warning(f"Nginx configuration warning: {nginx_error}")
+
+        # TODO: Apply AI design if provided
+        if ai_design:
+            logger.info(f"✨ AI design will be applied (not yet implemented)")
+
+        # Return success
+        return (
+            jsonify(
+                {
+                    "success": True,
+                    "domain": {
+                        "full_domain": full_domain,
+                        "subdomain": subdomain,
+                        "parent_domain": parent_domain,
+                        "url": f"http://{full_domain}",
+                        "ssl_enabled": False,
+                        "port": port,
+                    },
+                    "wordpress": {
+                        "admin_url": f"http://{full_domain}/wp-admin",
+                        "admin_user": site_config.get("admin_user", "admin"),
+                        "site_title": site_config.get("site_title", subdomain),
+                        "template": template,
+                        "plugins_installed": True,
+                        "theme_activated": True,
+                    },
+                    "ai_design_applied": ai_design is not None,
+                    "message": f"WordPress deployed successfully to {full_domain}",
+                }
+            ),
+            200,
+        )
+
+    except Exception as e:
+        logger.error(f"WordPress template deployment failed: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ============================================================================
+# WooCommerce Routes
+# ============================================================================
+
+
+@wp_bp.route("/deploy-woocommerce", methods=["POST"])
+def deploy_woocommerce_site():
+    """
+    Deploy a complete WooCommerce site in one request
+
+    POST /api/wordpress/deploy-woocommerce
+    """
+    try:
+        data = request.get_json()
+
+        # Validate required fields
+        required = ["name", "domain", "adminEmail", "adminPassword"]
+        for field in required:
+            if field not in data:
+                return jsonify({"success": False, "error": f"Missing: {field}"}), 400
+
+        site_name = data["name"]
+        domain = data["domain"]
+        admin_email = data["adminEmail"]
+        admin_password = data["adminPassword"]
+        site_title = data.get("siteTitle", f"{site_name} Shop")
+
+        # Get port
+        port = data.get("port")
+        if not port:
+            ports = find_available_ports(8000, 1)
+            port = ports[0]
+
+        logger.info(f"🛒 Deploying WooCommerce: {site_name} on {domain}:{port}")
+
+        # Step 1: Deploy WordPress
+        logger.info("Step 1: Deploying WordPress...")
+        wp_result = create_wordpress_site(
+            site_name=site_name,
+            domain=domain,
+            port=port,
+            admin_email=admin_email,
+            admin_password=admin_password,
+            site_title=site_title,
+        )
+
+        # Step 2: Setup nginx
+        logger.info("Step 2: Configuring nginx...")
+        try:
+            create_nginx_reverse_proxy(domain, port)
+            reload_nginx()
+        except Exception as e:
+            logger.warning(f"Nginx warning: {e}")
+
+        # Step 3: Setup WooCommerce
+        logger.info("Step 3: Setting up WooCommerce...")
+        store_config = data.get("store", {})
+        wc_config = {
+            "store_address": store_config.get("store_address"),
+            "store_city": store_config.get("store_city"),
+            "store_postcode": store_config.get("store_postcode"),
+            "store_country": store_config.get("store_country", "ZA"),
+            "currency": store_config.get("currency", "ZAR"),
+            "products_per_page": store_config.get("products_per_page", 12),
+            "install_storefront": store_config.get("install_storefront", True),
+            "install_plugins": store_config.get("install_plugins", []),
+        }
+
+        wc_result = setup_woocommerce(site_name, wc_config)
+
+        # Step 4: Create sample products if requested
+        if store_config.get("create_sample_products", False):
+            logger.info("Step 4: Creating sample products...")
+            product_count = store_config.get("sample_product_count", 5)
+            products_result = create_sample_products(site_name, product_count)
+            wc_result["sample_products"] = products_result
+
+        # Return response
+        return (
+            jsonify(
+                {
+                    "success": True,
+                    "message": "WooCommerce site deployed successfully",
+                    "domain": {
+                        "url": f"http://{domain}",
+                        "full_domain": domain,
+                        "port": port,
+                    },
+                    "wordpress": {
+                        "admin_url": f"http://{domain}/wp-admin",
+                        "admin_user": "admin",
+                        "site_title": site_title,
+                    },
+                    "woocommerce": {
+                        "shop_url": f"http://{domain}/shop",
+                        "setup_complete": wc_result["success"],
+                        "steps_completed": wc_result.get("steps_completed", []),
+                    },
+                    "credentials": {
+                        "username": "admin",
+                        "password": admin_password,
+                        "email": admin_email,
+                    },
+                }
+            ),
+            200,
+        )
+
+    except Exception as e:
+        logger.error(f"WooCommerce deployment failed: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ============================================================================
+# Cleanup Routes
+# ============================================================================
+
+
+@wp_bp.route("/<site_name>/cleanup", methods=["DELETE", "POST"])
+def cleanup_site(site_name):
+    """Complete cleanup of a WordPress site"""
+    try:
+        data = request.get_json() or {}
+
+        logger.info(f"🗑️ Cleaning up: {site_name}")
+
+        result = cleanup_wordpress_site(
+            site_name,
+            remove_volumes=data.get("remove_volumes", True),
+            remove_nginx=data.get("remove_nginx", True),
+            remove_db_entry=data.get("remove_db_entry", True),
+        )
+
+        return (
+            jsonify(
+                {
+                    "success": True,
+                    "message": f"Site {site_name} cleaned up",
+                    "result": result,
+                }
+            ),
+            200,
+        )
+
+    except Exception as e:
+        logger.error(f"Cleanup failed: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@wp_bp.route("/cleanup/list", methods=["GET"])
+def list_cleanup_sites():
+    """List all WordPress sites with cleanup information"""
+    try:
+        result = list_sites_for_cleanup()
+        return jsonify(result), 200
+    except Exception as e:
+        logger.error(f"Failed to list cleanup sites: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@wp_bp.route("/cleanup/orphaned", methods=["POST"])
+def cleanup_orphaned():
+    """Find and cleanup orphaned Docker containers"""
+    try:
+        logger.info("Starting orphaned container cleanup...")
+        result = cleanup_orphaned_containers()
+        return (
+            jsonify(
+                {
+                    "success": True,
+                    "message": f"Cleaned up {len(result['cleaned_containers'])} orphaned containers",
+                    "result": result,
+                }
+            ),
+            200,
+        )
+    except Exception as e:
+        logger.error(f"Orphaned cleanup failed: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 # ============================================================================
 # AI Design Routes (for WordPress)
 # ============================================================================
@@ -464,112 +746,6 @@ def get_moods():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-@wp_bp.route("/deploy-template", methods=["POST"])
-def deploy_wordpress_template():
-    """
-    Deploy WordPress with template configuration (for AI-enhanced deployment)
-
-    POST /api/wordpress/deploy-template
-    Also available at: /api/deploy/wordpress-template (via alias below)
-    """
-    try:
-        data = request.get_json()
-
-        # Extract configuration
-        template = data.get("template")
-        domain_config = data.get("domain_config", {})
-        site_config = data.get("site_config", {})
-        auto_setup = data.get("auto_setup", True)
-        ai_design = data.get("ai_design")
-
-        # Validate required fields
-        if not template:
-            return jsonify({"success": False, "error": "Template is required"}), 400
-
-        if not domain_config.get("subdomain") or not domain_config.get("parent_domain"):
-            return (
-                jsonify(
-                    {"success": False, "error": "Domain configuration is required"}
-                ),
-                400,
-            )
-
-        if not site_config.get("admin_password") or not site_config.get("admin_email"):
-            return (
-                jsonify({"success": False, "error": "Admin credentials are required"}),
-                400,
-            )
-
-        # Build domain
-        subdomain = domain_config["subdomain"]
-        parent_domain = domain_config["parent_domain"]
-        full_domain = f"{subdomain}.{parent_domain}"
-
-        # Get port
-        port = domain_config.get("port")
-        if not port:
-            ports = find_available_ports(8000, 1)
-            port = ports[0]
-
-        logger.info(
-            f"🚀 Deploying WordPress template '{template}' to {full_domain}:{port}"
-        )
-
-        # Create WordPress site
-        result = create_wordpress_site(
-            site_name=subdomain,
-            domain=full_domain,
-            port=port,
-            admin_email=site_config["admin_email"],
-            admin_password=site_config["admin_password"],
-            site_title=site_config.get("site_title", subdomain),
-        )
-
-        # Create nginx reverse proxy
-        try:
-            create_nginx_reverse_proxy(full_domain, port)
-            reload_nginx()
-            logger.info(f"✅ Nginx configured for {full_domain}")
-        except Exception as nginx_error:
-            logger.warning(f"Nginx configuration warning: {nginx_error}")
-
-        # TODO: Apply AI design if provided
-        if ai_design:
-            logger.info(f"✨ AI design will be applied (not yet implemented)")
-
-        # Return success
-        return (
-            jsonify(
-                {
-                    "success": True,
-                    "domain": {
-                        "full_domain": full_domain,
-                        "subdomain": subdomain,
-                        "parent_domain": parent_domain,
-                        "url": f"http://{full_domain}",
-                        "ssl_enabled": False,
-                        "port": port,
-                    },
-                    "wordpress": {
-                        "admin_url": f"http://{full_domain}/wp-admin",
-                        "admin_user": site_config.get("admin_user", "admin"),
-                        "site_title": site_config.get("site_title", subdomain),
-                        "template": template,
-                        "plugins_installed": True,
-                        "theme_activated": True,
-                    },
-                    "ai_design_applied": ai_design is not None,
-                    "message": f"WordPress deployed successfully to {full_domain}",
-                }
-            ),
-            200,
-        )
-
-    except Exception as e:
-        logger.error(f"WordPress template deployment failed: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
 # ============================================================================
 # Route Registration
 # ============================================================================
@@ -579,4 +755,6 @@ def register_routes(app):
     """Register all WordPress-related routes (called by routes/__init__.py)"""
     app.register_blueprint(wp_bp)
     app.register_blueprint(ai_bp)
-    logger.info("✅ WordPress routes registered (core + AI design)")
+    logger.info(
+        "✅ WordPress routes registered (core + AI design + WooCommerce + cleanup)"
+    )
