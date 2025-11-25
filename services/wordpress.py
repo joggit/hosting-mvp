@@ -339,13 +339,10 @@ networks:
         )
 
     # Wait for MySQL database to be ready
-    logger.info("Waiting for MySQL database to initialize...")
-    if not wait_for_mysql_ready(mysql_container, max_wait=60):
-        logger.warning("MySQL not responding, attempting installation anyway...")
-    else:
-        # Give MySQL a moment to stabilize after accepting connections
-        logger.info("MySQL ready, waiting for stabilization...")
-        time.sleep(25)
+    # Wait for MySQL database and network to be ready
+    # MySQL needs 45 seconds for network connectivity to be established
+    logger.info("Waiting for MySQL database and Docker network to be ready...")
+    time.sleep(45)
 
     # Install WordPress with retry logic
     logger.info("Installing WordPress...")
