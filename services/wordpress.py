@@ -345,7 +345,7 @@ networks:
     else:
         # Give MySQL a moment to stabilize after accepting connections
         logger.info("MySQL ready, waiting for stabilization...")
-        time.sleep(5)
+        time.sleep(25)
 
     # Install WordPress with retry logic
     logger.info("Installing WordPress...")
