@@ -396,7 +396,8 @@ def execute_wp_cli(site_name, command):
     # Execute command
     try:
         result = subprocess.run(
-            ["docker", "exec", cli_container, "wp"] + command.split(),
+            ["docker", "exec", "--user", "www-data", cli_container, "wp"]
+            + command.split(),
             capture_output=True,
             text=True,
             timeout=120,
