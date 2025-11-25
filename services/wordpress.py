@@ -192,9 +192,9 @@ def install_wordpress_with_retry(
 # ============================================================================
 
 
-def generate_password(length=20):
-    """Generate secure random password"""
-    alphabet = string.ascii_letters + string.digits + "!@#$%^&*()"
+def generate_password(length=32):
+    """Generate secure alphanumeric password (no special chars for compatibility)"""
+    alphabet = string.ascii_letters + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
