@@ -1,7 +1,7 @@
 """
 WordPress deployment and management service
 Handles Docker-based WordPress deployments
-FINAL WORKING VERSION with CLI container that stays alive
+FIXED VERSION with site-specific volumes to prevent MySQL initialization issues
 """
 
 import os
@@ -17,7 +17,7 @@ from services.database import get_db
 
 logger = logging.getLogger(__name__)
 
-WORDPRESS_BASE_DIR = "/var/www/wordpress-sites"
+WORDPRESS_BASE_DIR = Path("/var/www/wordpress-sites")
 
 
 # ============================================================================
@@ -198,6 +198,32 @@ def generate_password(length=32):
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
+def cleanup_old_volumes(site_name):
+    """Remove old Docker volumes to ensure fresh MySQL initialization"""
+    site_dir = WORDPRESS_BASE_DIR / site_name
+    compose_path = site_dir / "docker-compose.yml"
+
+    if not compose_path.exists():
+        logger.debug(f"No existing compose file for {site_name}, skipping cleanup")
+        return
+
+    try:
+        logger.info(f"Cleaning up old volumes for {site_name}...")
+        result = subprocess.run(
+            ["docker-compose", "-f", str(compose_path), "down", "-v"],
+            cwd=site_dir,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            logger.info("✅ Old volumes removed")
+        else:
+            logger.debug(f"Volume cleanup output: {result.stderr}")
+    except Exception as e:
+        logger.debug(f"Volume cleanup error (OK if first deploy): {e}")
+
+
 # ============================================================================
 # WordPress Site Management
 # ============================================================================
@@ -223,10 +249,14 @@ def create_wordpress_site(
     cli_container = f"{site_name}_cli"
 
     # Create site directory
-    site_dir = os.path.join(WORDPRESS_BASE_DIR, site_name)
-    os.makedirs(site_dir, exist_ok=True)
+    site_dir = WORDPRESS_BASE_DIR / site_name
+    site_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create docker-compose.yml with CLI container that stays alive
+    # Clean up old volumes BEFORE creating new docker-compose
+    cleanup_old_volumes(site_name)
+
+    # Create docker-compose.yml with SITE-SPECIFIC volume names
+    # This ensures each site gets fresh MySQL that will run initialization
     docker_compose = f"""version: '3.8'
 
 services:
@@ -289,7 +319,9 @@ services:
 
 volumes:
   wordpress_data:
+    name: {site_name}_wordpress_data
   mysql_data:
+    name: {site_name}_mysql_data
 
 networks:
   wordpress_network:
@@ -297,10 +329,8 @@ networks:
 """
 
     # Write docker-compose.yml
-    compose_path = os.path.join(site_dir, "docker-compose.yml")
-    with open(compose_path, "w") as f:
-        f.write(docker_compose)
-
+    compose_path = site_dir / "docker-compose.yml"
+    compose_path.write_text(docker_compose)
     logger.info(f"Docker Compose written to: {compose_path}")
 
     # Start containers
@@ -338,9 +368,8 @@ networks:
             "WordPress not responding to HTTP, but continuing with installation..."
         )
 
-    # Wait for MySQL database to be ready
     # Wait for MySQL database and network to be ready
-    # MySQL needs 45 seconds for network connectivity to be established
+    # MySQL needs time for network connectivity and user initialization
     logger.info("Waiting for MySQL database and Docker network to be ready...")
     time.sleep(45)
 
@@ -439,7 +468,7 @@ networks:
             mysql_container,
             cli_container,
             admin_email,
-            compose_path,
+            str(compose_path),
         ),
     )
 
