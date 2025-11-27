@@ -30,7 +30,7 @@ CORS(app)
 init_database()
 
 # Ensure WordPress base directory exists
-WORDPRESS_BASE_DIR = "/var/www/wordpress-sites"
+WORDPRESS_BASE_DIR = "/var/www/wordpress"
 os.makedirs(WORDPRESS_BASE_DIR, exist_ok=True)
 logger.info(f"✅ WordPress directory: {WORDPRESS_BASE_DIR}")
 
