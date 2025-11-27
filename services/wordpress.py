@@ -1,638 +1,675 @@
 """
-WordPress deployment and management service
-Handles Docker-based WordPress deployments
-FIXED VERSION with site-specific volumes to prevent MySQL initialization issues
+WordPress deployment and management service - TRADITIONAL APPROACH
+No Docker - uses shared MySQL, PHP-FPM pools, and nginx server blocks
+Like the Next.js deployment but for WordPress
 """
 
 import os
 import subprocess
-import json
 import logging
 import secrets
 import string
-import time
-import requests
+import shutil
 from pathlib import Path
 from services.database import get_db
 
 logger = logging.getLogger(__name__)
 
-WORDPRESS_BASE_DIR = Path("/var/www/wordpress-sites")
+# Configuration
+WORDPRESS_BASE_DIR = Path("/var/www/wordpress")
+NGINX_SITES_AVAILABLE = Path("/etc/nginx/sites-available")
+NGINX_SITES_ENABLED = Path("/etc/nginx/sites-enabled")
+PHP_FPM_POOL_DIR = Path("/etc/php/8.3/fpm/pool.d")  # Adjust version as needed
+MYSQL_HOST = "localhost"
+MYSQL_ROOT_USER = "root"
+MYSQL_ROOT_PASSWORD = os.environ.get("MYSQL_ROOT_PASSWORD", "root_password")
 
 
 # ============================================================================
-# Helper Functions for Container Readiness
-# ============================================================================
-
-
-def wait_for_container_ready(site_name, container_suffix="_cli", max_wait=60):
-    """Wait for container to be fully running"""
-    container_name = f"{site_name}{container_suffix}"
-    logger.info(f"Waiting for container {container_name} to be ready...")
-    start_time = time.time()
-
-    while (time.time() - start_time) < max_wait:
-        try:
-            result = subprocess.run(
-                [
-                    "docker",
-                    "ps",
-                    "--filter",
-                    f"name={container_name}",
-                    "--format",
-                    "{{.Status}}",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-
-            status = result.stdout.strip()
-            if "Up" in status:
-                logger.info(f"✅ Container is running: {status}")
-                return True
-
-            logger.debug(f"Container status: {status or 'not running'}")
-        except Exception as e:
-            logger.debug(f"Container check error: {e}")
-
-        time.sleep(2)
-
-    logger.error(f"❌ Container did not start within {max_wait} seconds")
-    return False
-
-
-def wait_for_wordpress_ready(port, max_wait=90):
-    """Wait for WordPress to respond to HTTP requests"""
-    logger.info(f"Waiting for WordPress at http://localhost:{port} to respond...")
-    start_time = time.time()
-    url = f"http://localhost:{port}"
-
-    while (time.time() - start_time) < max_wait:
-        try:
-            response = requests.get(url, timeout=5)
-            if response.status_code in [200, 302, 500]:
-                logger.info(
-                    f"✅ WordPress is responding (status: {response.status_code})"
-                )
-                return True
-        except requests.exceptions.RequestException as e:
-            logger.debug(f"WordPress not ready yet: {e}")
-
-        time.sleep(3)
-
-    logger.error(f"❌ WordPress did not respond within {max_wait} seconds")
-    return False
-
-
-def wait_for_mysql_ready(mysql_container, max_wait=60):
-    """Wait for MySQL database to be ready to accept connections"""
-    logger.info(f"Waiting for MySQL database to be ready...")
-    start_time = time.time()
-
-    while (time.time() - start_time) < max_wait:
-        try:
-            # Check if MySQL is accepting connections
-            result = subprocess.run(
-                [
-                    "docker",
-                    "exec",
-                    mysql_container,
-                    "mysqladmin",
-                    "ping",
-                    "-h",
-                    "localhost",
-                    "--silent",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-
-            if result.returncode == 0:
-                logger.info(f"✅ MySQL is ready and accepting connections")
-                return True
-
-            logger.debug(f"MySQL not ready yet (exit code: {result.returncode})")
-        except subprocess.TimeoutExpired:
-            logger.debug("MySQL ping timed out")
-        except Exception as e:
-            logger.debug(f"MySQL check error: {e}")
-
-        time.sleep(2)
-
-    logger.error(f"❌ MySQL did not become ready within {max_wait} seconds")
-    return False
-
-
-def install_wordpress_with_retry(
-    site_name, site_title, admin_user, admin_password, admin_email, url, max_retries=3
-):
-    """Install WordPress with retry logic using CLI container"""
-    cli_container = f"{site_name}_cli"
-
-    for attempt in range(max_retries):
-        try:
-            logger.info(
-                f"Installing WordPress (attempt {attempt + 1}/{max_retries})..."
-            )
-
-            install_cmd = [
-                "docker",
-                "exec",
-                cli_container,
-                "wp",
-                "core",
-                "install",
-                f"--url={url}",
-                f"--title={site_title}",
-                f"--admin_user={admin_user}",
-                f"--admin_password={admin_password}",
-                f"--admin_email={admin_email}",
-                "--skip-email",
-            ]
-
-            result = subprocess.run(
-                install_cmd, capture_output=True, text=True, timeout=60
-            )
-
-            if result.returncode == 0:
-                logger.info(f"✅ WordPress installed successfully")
-                logger.info(f"Output: {result.stdout}")
-                return True
-            else:
-                error_msg = result.stderr or result.stdout or "Unknown error"
-                logger.warning(f"Install attempt {attempt + 1} failed: {error_msg}")
-
-                # If already installed, that's OK
-                if "already installed" in error_msg.lower():
-                    logger.info("✅ WordPress already installed")
-                    return True
-
-                # Wait before retry
-                if attempt < max_retries - 1:
-                    logger.info(f"Waiting 5 seconds before retry...")
-                    time.sleep(5)
-
-        except subprocess.TimeoutExpired:
-            logger.warning(f"Install attempt {attempt + 1} timed out")
-            if attempt < max_retries - 1:
-                time.sleep(5)
-        except Exception as e:
-            logger.error(f"Install attempt {attempt + 1} error: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(5)
-
-    logger.error("❌ WordPress installation failed after all retries")
-    return False
-
-
-# ============================================================================
-# Utility Functions
+# Helper Functions
 # ============================================================================
 
 
 def generate_password(length=32):
-    """Generate secure alphanumeric password (no special chars for compatibility)"""
+    """Generate secure alphanumeric password"""
     alphabet = string.ascii_letters + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
-def cleanup_old_volumes(site_name):
-    """Remove old Docker volumes to ensure fresh MySQL initialization"""
-    site_dir = WORDPRESS_BASE_DIR / site_name
-    compose_path = site_dir / "docker-compose.yml"
-
-    if not compose_path.exists():
-        logger.debug(f"No existing compose file for {site_name}, skipping cleanup")
-        return
-
+def run_command(cmd, shell=False, check=True, **kwargs):
+    """Run a shell command and return result"""
     try:
-        logger.info(f"Cleaning up old volumes for {site_name}...")
+        if isinstance(cmd, str) and not shell:
+            cmd = cmd.split()
+
         result = subprocess.run(
-            ["docker-compose", "-f", str(compose_path), "down", "-v"],
-            cwd=site_dir,
-            capture_output=True,
-            text=True,
-            timeout=30,
+            cmd, shell=shell, capture_output=True, text=True, check=check, **kwargs
         )
-        if result.returncode == 0:
-            logger.info("✅ Old volumes removed")
-        else:
-            logger.debug(f"Volume cleanup output: {result.stderr}")
-    except Exception as e:
-        logger.debug(f"Volume cleanup error (OK if first deploy): {e}")
+        return result
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Command failed: {e.stderr}")
+        raise
+
+
+def run_mysql_query(query, database=None):
+    """Execute MySQL query"""
+    cmd = [
+        "mysql",
+        "-u",
+        MYSQL_ROOT_USER,
+        f"-p{MYSQL_ROOT_PASSWORD}",
+    ]
+
+    if database:
+        cmd.extend(["-D", database])
+
+    cmd.extend(["-e", query])
+
+    result = run_command(cmd, check=True)
+    return result.stdout
 
 
 # ============================================================================
-# WordPress Site Management
+# MySQL Database Management
 # ============================================================================
 
 
-def create_wordpress_site(
-    site_name, domain, port, admin_email, admin_password, site_title
-):
+def create_mysql_database(db_name, db_user, db_password):
+    """Create MySQL database and user"""
+    logger.info(f"Creating MySQL database: {db_name}")
+
+    # Create database
+    run_mysql_query(
+        f"CREATE DATABASE IF NOT EXISTS `{db_name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+    )
+
+    # Create user and grant privileges
+    run_mysql_query(
+        f"""
+        CREATE USER IF NOT EXISTS '{db_user}'@'localhost' IDENTIFIED BY '{db_password}';
+        GRANT ALL PRIVILEGES ON `{db_name}`.* TO '{db_user}'@'localhost';
+        FLUSH PRIVILEGES;
     """
-    Deploy a new WordPress site using Docker
+    )
 
-    Returns: dict with site details or raises exception
-    """
-    logger.info(f"Creating WordPress site: {site_name}")
+    logger.info(f"✅ Database {db_name} created with user {db_user}")
 
-    # Generate passwords
-    db_password = generate_password()
-    db_root_password = generate_password()
 
-    # Container names
-    wp_container = f"{site_name}_wordpress"
-    mysql_container = f"{site_name}_mysql"
-    cli_container = f"{site_name}_cli"
+def delete_mysql_database(db_name, db_user):
+    """Delete MySQL database and user"""
+    logger.info(f"Deleting MySQL database: {db_name}")
 
-    # Create site directory
-    site_dir = WORDPRESS_BASE_DIR / site_name
-    site_dir.mkdir(parents=True, exist_ok=True)
+    run_mysql_query(f"DROP DATABASE IF EXISTS `{db_name}`;", check=False)
+    run_mysql_query(f"DROP USER IF EXISTS '{db_user}'@'localhost';", check=False)
+    run_mysql_query("FLUSH PRIVILEGES;")
 
-    # Clean up old volumes BEFORE creating new docker-compose
-    cleanup_old_volumes(site_name)
+    logger.info(f"✅ Database {db_name} deleted")
 
-    # Create docker-compose.yml with SITE-SPECIFIC volume names
-    # This ensures each site gets fresh MySQL that will run initialization
-    docker_compose = f"""version: '3.8'
 
-services:
-  wordpress:
-    image: wordpress:latest
-    container_name: {wp_container}
-    restart: always
-    ports:
-      - "{port}:80"
-    environment:
-      WORDPRESS_DB_HOST: mysql
-      WORDPRESS_DB_USER: wordpress
-      WORDPRESS_DB_PASSWORD: {db_password}
-      WORDPRESS_DB_NAME: wordpress
-      WORDPRESS_CONFIG_EXTRA: |
-        define('WP_HOME', 'http://{domain}');
-        define('WP_SITEURL', 'http://{domain}');
-        define('WP_MEMORY_LIMIT', '256M');
-        define('WP_MAX_MEMORY_LIMIT', '512M');
-    volumes:
-      - wordpress_data:/var/www/html
-    depends_on:
-      - mysql
-    networks:
-      - wordpress_network
+# ============================================================================
+# PHP-FPM Pool Management
+# ============================================================================
 
-  mysql:
-    image: mysql:8.0
-    container_name: {mysql_container}
-    restart: always
-    environment:
-      MYSQL_DATABASE: wordpress
-      MYSQL_USER: wordpress
-      MYSQL_PASSWORD: {db_password}
-      MYSQL_ROOT_PASSWORD: {db_root_password}
-    volumes:
-      - mysql_data:/var/lib/mysql
-    networks:
-      - wordpress_network
-    command: '--default-authentication-plugin=mysql_native_password'
 
-  wp-cli:
-    image: wordpress:cli
-    container_name: {cli_container}
-    restart: always
-    volumes:
-      - wordpress_data:/var/www/html
-    depends_on:
-      - wordpress
-      - mysql
-    networks:
-      - wordpress_network
-    environment:
-      WORDPRESS_DB_HOST: mysql
-      WORDPRESS_DB_USER: wordpress
-      WORDPRESS_DB_PASSWORD: {db_password}
-      WORDPRESS_DB_NAME: wordpress
-    entrypoint: ["sh"]
-    command: ["-c", "tail -f /dev/null"]
+def create_php_fpm_pool(site_name, user="www-data", group="www-data"):
+    """Create dedicated PHP-FPM pool for site"""
+    logger.info(f"Creating PHP-FPM pool for {site_name}")
 
-volumes:
-  wordpress_data:
-    name: {site_name}_wordpress_data
-  mysql_data:
-    name: {site_name}_mysql_data
+    pool_config = f"""[{site_name}]
+user = {user}
+group = {group}
+listen = /run/php/php-fpm-{site_name}.sock
+listen.owner = {user}
+listen.group = www-data
+listen.mode = 0660
 
-networks:
-  wordpress_network:
-    driver: bridge
+pm = dynamic
+pm.max_children = 5
+pm.start_servers = 2
+pm.min_spare_servers = 1
+pm.max_spare_servers = 3
+
+php_admin_value[error_log] = /var/log/php-fpm/{site_name}-error.log
+php_admin_flag[log_errors] = on
+
+php_value[session.save_handler] = files
+php_value[session.save_path] = /var/lib/php/sessions
 """
 
-    # Write docker-compose.yml
-    compose_path = site_dir / "docker-compose.yml"
-    compose_path.write_text(docker_compose)
-    logger.info(f"Docker Compose written to: {compose_path}")
+    pool_file = PHP_FPM_POOL_DIR / f"{site_name}.conf"
+    pool_file.write_text(pool_config)
 
-    # Start containers
-    logger.info("Starting Docker containers...")
-    try:
-        subprocess.run(
-            ["docker-compose", "up", "-d"],
-            cwd=site_dir,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        logger.info("✅ Containers started")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to start containers: {e.stderr}")
-        raise Exception(f"Docker Compose failed: {e.stderr}")
+    # Reload PHP-FPM
+    run_command("systemctl reload php8.3-fpm", shell=True)
 
-    # ============================================================================
-    # Wait for containers and install WordPress
-    # ============================================================================
+    logger.info(f"✅ PHP-FPM pool created: {site_name}")
 
-    # Wait for WordPress container to be running
-    logger.info("Waiting for WordPress container to be ready...")
-    if not wait_for_container_ready(site_name, "_wordpress", max_wait=60):
-        raise Exception("WordPress container failed to start properly")
 
-    # Wait for CLI container to be running
-    logger.info("Waiting for CLI container to be ready...")
-    if not wait_for_container_ready(site_name, "_cli", max_wait=60):
-        raise Exception("CLI container failed to start properly")
+def delete_php_fpm_pool(site_name):
+    """Delete PHP-FPM pool"""
+    logger.info(f"Deleting PHP-FPM pool for {site_name}")
 
-    # Wait for WordPress to respond to HTTP
-    if not wait_for_wordpress_ready(port, max_wait=90):
-        logger.warning(
-            "WordPress not responding to HTTP, but continuing with installation..."
-        )
+    pool_file = PHP_FPM_POOL_DIR / f"{site_name}.conf"
+    if pool_file.exists():
+        pool_file.unlink()
+        run_command("systemctl reload php8.3-fpm", shell=True)
 
-    # Wait for MySQL database and network to be ready
-    # MySQL needs time for network connectivity and user initialization
-    logger.info("Waiting for MySQL database and Docker network to be ready...")
-    time.sleep(45)
+    logger.info(f"✅ PHP-FPM pool deleted: {site_name}")
 
-    # Install WordPress with retry logic
-    logger.info("Installing WordPress...")
-    install_success = install_wordpress_with_retry(
-        site_name=site_name,
-        site_title=site_title,
-        admin_user="admin",
-        admin_password=admin_password,
-        admin_email=admin_email,
-        url=f"http://{domain}",
-        max_retries=3,
+
+# ============================================================================
+# Nginx Configuration
+# ============================================================================
+
+
+def create_nginx_config(site_name, domain):
+    """Create nginx server block for WordPress site"""
+    logger.info(f"Creating nginx config for {domain}")
+
+    site_root = WORDPRESS_BASE_DIR / site_name
+
+    nginx_config = f"""server {{
+    listen 80;
+    server_name {domain};
+    
+    root {site_root};
+    index index.php index.html;
+    
+    access_log /var/log/nginx/{site_name}-access.log;
+    error_log /var/log/nginx/{site_name}-error.log;
+    
+    # WordPress permalinks
+    location / {{
+        try_files $uri $uri/ /index.php?$args;
+    }}
+    
+    # PHP handling
+    location ~ \\.php$ {{
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php-fpm-{site_name}.sock;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        include fastcgi_params;
+    }}
+    
+    # Deny access to sensitive files
+    location ~ /\\.ht {{
+        deny all;
+    }}
+    
+    location = /favicon.ico {{
+        log_not_found off;
+        access_log off;
+    }}
+    
+    location = /robots.txt {{
+        log_not_found off;
+        access_log off;
+    }}
+    
+    # Static files caching
+    location ~* \\.(css|js|jpg|jpeg|png|gif|ico|svg|woff|woff2|ttf)$ {{
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+    }}
+}}
+"""
+
+    # Write config
+    config_file = NGINX_SITES_AVAILABLE / f"{site_name}.conf"
+    config_file.write_text(nginx_config)
+
+    # Enable site
+    enabled_link = NGINX_SITES_ENABLED / f"{site_name}.conf"
+    if enabled_link.exists():
+        enabled_link.unlink()
+    enabled_link.symlink_to(config_file)
+
+    # Test and reload nginx
+    test_result = run_command("nginx -t", shell=True, check=False)
+    if test_result.returncode == 0:
+        run_command("systemctl reload nginx", shell=True)
+        logger.info(f"✅ Nginx config created and activated for {domain}")
+    else:
+        logger.error(f"Nginx config test failed: {test_result.stderr}")
+        raise Exception("Invalid nginx configuration")
+
+
+def delete_nginx_config(site_name):
+    """Delete nginx configuration"""
+    logger.info(f"Deleting nginx config for {site_name}")
+
+    enabled_link = NGINX_SITES_ENABLED / f"{site_name}.conf"
+    config_file = NGINX_SITES_AVAILABLE / f"{site_name}.conf"
+
+    if enabled_link.exists():
+        enabled_link.unlink()
+    if config_file.exists():
+        config_file.unlink()
+
+    run_command("systemctl reload nginx", shell=True)
+    logger.info(f"✅ Nginx config deleted")
+
+
+# ============================================================================
+# WordPress Installation
+# ============================================================================
+
+
+def download_wordpress(site_dir):
+    """Download and extract WordPress"""
+    logger.info("Downloading WordPress...")
+
+    site_dir.mkdir(parents=True, exist_ok=True)
+
+    # Download WordPress
+    wp_zip = site_dir.parent / "wordpress.tar.gz"
+    run_command(
+        ["wget", "https://wordpress.org/latest.tar.gz", "-O", str(wp_zip), "-q"]
     )
 
-    if not install_success:
-        raise Exception(
-            "WordPress installation failed - containers created but WordPress not configured"
-        )
+    # Extract
+    run_command(["tar", "xzf", str(wp_zip), "-C", str(site_dir.parent)])
 
-    logger.info("✅ WordPress installation complete")
+    # Move files from wordpress/ subdirectory to site root
+    wp_temp = site_dir.parent / "wordpress"
+    for item in wp_temp.iterdir():
+        shutil.move(str(item), str(site_dir))
+    wp_temp.rmdir()
+    wp_zip.unlink()
 
-    # Fix wp-content permissions for plugin installation
-    logger.info("Configuring wp-content permissions...")
-    try:
-        # Run comprehensive permission fix
-        subprocess.run(
-            [
-                "docker",
-                "exec",
-                wp_container,
-                "chown",
-                "-R",
-                "www-data:www-data",
-                "/var/www/html/wp-content",
-            ],
-            check=True,
-            timeout=30,
-        )
-        subprocess.run(
-            [
-                "docker",
-                "exec",
-                wp_container,
-                "find",
-                "/var/www/html/wp-content",
-                "-type",
-                "d",
-                "-exec",
-                "chmod",
-                "755",
-                "{}",
-                ";",
-            ],
-            check=True,
-            timeout=30,
-        )
-        subprocess.run(
-            [
-                "docker",
-                "exec",
-                wp_container,
-                "find",
-                "/var/www/html/wp-content",
-                "-type",
-                "f",
-                "-exec",
-                "chmod",
-                "644",
-                "{}",
-                ";",
-            ],
-            check=True,
-            timeout=30,
-        )
-        logger.info("✅ Permissions configured")
-    except Exception as e:
-        logger.warning(f"Permission setup warning: {e}")
+    logger.info("✅ WordPress downloaded and extracted")
 
-    # Save to database
-    conn = get_db()
-    cursor = conn.cursor()
 
-    cursor.execute(
-        """
-        INSERT INTO wordpress_sites 
-        (site_name, domain, port, container_name, mysql_container, cli_container,
-         admin_email, docker_compose_path, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running')
-    """,
-        (
-            site_name,
-            domain,
-            port,
-            wp_container,
-            mysql_container,
-            cli_container,
-            admin_email,
-            str(compose_path),
-        ),
-    )
+def create_wp_config(site_dir, db_name, db_user, db_password, domain):
+    """Create wp-config.php"""
+    logger.info("Creating wp-config.php...")
 
-    site_id = cursor.lastrowid
+    wp_config_sample = site_dir / "wp-config-sample.php"
+    wp_config = site_dir / "wp-config.php"
 
-    # Log deployment
-    cursor.execute(
-        """
-        INSERT INTO deployment_logs (domain_name, action, status, message)
-        VALUES (?, 'wordpress_deploy', 'success', ?)
-    """,
-        (domain, f"WordPress site deployed: {site_name}"),
-    )
+    if not wp_config_sample.exists():
+        raise Exception("wp-config-sample.php not found")
 
-    conn.commit()
-    conn.close()
+    config_content = wp_config_sample.read_text()
 
-    logger.info(f"✅ WordPress site created: {site_name}")
+    # Replace database settings
+    config_content = config_content.replace("database_name_here", db_name)
+    config_content = config_content.replace("username_here", db_user)
+    config_content = config_content.replace("password_here", db_password)
+    config_content = config_content.replace("localhost", MYSQL_HOST)
 
-    return {
-        "site_id": site_id,
-        "site_name": site_name,
-        "domain": domain,
-        "port": port,
-        "admin_url": f"http://{domain}/wp-admin",
-        "containers": {
-            "wordpress": wp_container,
-            "mysql": mysql_container,
-            "cli": cli_container,
-        },
+    # Generate salts
+    salts = {
+        "AUTH_KEY": generate_password(64),
+        "SECURE_AUTH_KEY": generate_password(64),
+        "LOGGED_IN_KEY": generate_password(64),
+        "NONCE_KEY": generate_password(64),
+        "AUTH_SALT": generate_password(64),
+        "SECURE_AUTH_SALT": generate_password(64),
+        "LOGGED_IN_SALT": generate_password(64),
+        "NONCE_SALT": generate_password(64),
     }
 
-
-def execute_wp_cli(site_name, command):
-    """Execute WP-CLI command on a WordPress site"""
-    logger.info(f"Executing WP-CLI on {site_name}: {command}")
-
-    # Get site details
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT cli_container, id FROM wordpress_sites WHERE site_name = ?",
-        (site_name,),
-    )
-    result = cursor.fetchone()
-
-    if not result:
-        conn.close()
-        raise Exception(f"WordPress site not found: {site_name}")
-
-    cli_container, site_id = result
-
-    # Execute command
-    try:
-        result = subprocess.run(
-            ["docker", "exec", "--user", "www-data", cli_container, "wp"]
-            + command.split(),
-            capture_output=True,
-            text=True,
-            timeout=120,
+    for key, value in salts.items():
+        config_content = config_content.replace(
+            f"put your unique phrase here", value, 1
         )
 
-        # Log command execution
+    # Add custom settings
+    custom_settings = f"""
+// Custom Settings
+define('WP_HOME', 'http://{domain}');
+define('WP_SITEURL', 'http://{domain}');
+define('WP_MEMORY_LIMIT', '256M');
+define('WP_MAX_MEMORY_LIMIT', '512M');
+"""
+
+    # Insert before "That's all"
+    config_content = config_content.replace(
+        "/* That's all, stop editing!",
+        custom_settings + "\n/* That's all, stop editing!",
+    )
+
+    wp_config.write_text(config_content)
+    logger.info("✅ wp-config.php created")
+
+
+def install_wordpress_core(
+    site_dir, site_title, admin_user, admin_password, admin_email, domain
+):
+    """Install WordPress using WP-CLI"""
+    logger.info("Installing WordPress core...")
+
+    # Download WP-CLI if not exists
+    wpcli = Path("/usr/local/bin/wp")
+    if not wpcli.exists():
+        logger.info("Downloading WP-CLI...")
+        run_command(
+            [
+                "curl",
+                "-O",
+                "https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar",
+            ]
+        )
+        run_command(["chmod", "+x", "wp-cli.phar"])
+        run_command(["mv", "wp-cli.phar", str(wpcli)])
+
+    # Install WordPress
+    result = run_command(
+        [
+            "wp",
+            "core",
+            "install",
+            f"--path={site_dir}",
+            f"--url=http://{domain}",
+            f"--title={site_title}",
+            f"--admin_user={admin_user}",
+            f"--admin_password={admin_password}",
+            f"--admin_email={admin_email}",
+            "--skip-email",
+            "--allow-root",
+        ],
+        check=False,
+    )
+
+    if result.returncode != 0 and "already installed" not in result.stderr.lower():
+        raise Exception(f"WordPress installation failed: {result.stderr}")
+
+    logger.info("✅ WordPress core installed")
+
+
+def set_permissions(site_dir):
+    """Set correct file permissions"""
+    logger.info("Setting file permissions...")
+
+    run_command(f"chown -R www-data:www-data {site_dir}", shell=True)
+    run_command(f"find {site_dir} -type d -exec chmod 755 {{}} \\;", shell=True)
+    run_command(f"find {site_dir} -type f -exec chmod 644 {{}} \\;", shell=True)
+
+    logger.info("✅ Permissions set")
+
+
+# ============================================================================
+# Main WordPress Deployment
+# ============================================================================
+
+
+def deploy_wordpress_site(
+    site_name, domain, admin_email, admin_password, site_title="My WordPress Site"
+):
+    """
+    Deploy a WordPress site using traditional hosting approach
+
+    Returns: dict with site details
+    """
+    logger.info(f"🚀 Deploying WordPress site: {site_name}")
+
+    # Generate database credentials
+    db_name = f"wp_{site_name}"
+    db_user = f"wp_{site_name}"
+    db_password = generate_password()
+
+    site_dir = WORDPRESS_BASE_DIR / site_name
+
+    try:
+        # 1. Create MySQL database
+        create_mysql_database(db_name, db_user, db_password)
+
+        # 2. Download WordPress
+        download_wordpress(site_dir)
+
+        # 3. Create wp-config.php
+        create_wp_config(site_dir, db_name, db_user, db_password, domain)
+
+        # 4. Create PHP-FPM pool
+        create_php_fpm_pool(site_name)
+
+        # 5. Create nginx config
+        create_nginx_config(site_name, domain)
+
+        # 6. Set permissions
+        set_permissions(site_dir)
+
+        # 7. Install WordPress
+        install_wordpress_core(
+            site_dir, site_title, "admin", admin_password, admin_email, domain
+        )
+
+        # 8. Save to database
+        conn = get_db()
+        cursor = conn.cursor()
+
         cursor.execute(
             """
-            INSERT INTO wordpress_cli_history (site_id, command, output, exit_code)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO wordpress_sites 
+            (site_name, domain, port, container_name, admin_email, 
+             docker_compose_path, status, mysql_database, mysql_user)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-            (site_id, command, result.stdout + result.stderr, result.returncode),
+            (
+                site_name,
+                domain,
+                80,
+                site_name,
+                admin_email,
+                str(site_dir),
+                "running",
+                db_name,
+                db_user,
+            ),
         )
-        conn.commit()
-        conn.close()
 
-        return {
-            "success": result.returncode == 0,
-            "output": result.stdout,
-            "error": result.stderr,
-            "exit_code": result.returncode,
-        }
+        site_id = cursor.lastrowid
 
-    except subprocess.TimeoutExpired:
-        conn.close()
-        raise Exception("Command timed out")
-    except Exception as e:
-        conn.close()
-        raise Exception(f"Command execution failed: {e}")
-
-
-def manage_wordpress_site(site_name, action):
-    """Manage WordPress site (start, stop, restart, delete)"""
-    logger.info(f"Managing WordPress site {site_name}: {action}")
-
-    # Get site details
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT docker_compose_path, id FROM wordpress_sites WHERE site_name = ?",
-        (site_name,),
-    )
-    result = cursor.fetchone()
-
-    if not result:
-        conn.close()
-        raise Exception(f"WordPress site not found: {site_name}")
-
-    compose_path, site_id = result
-    site_dir = os.path.dirname(compose_path)
-
-    try:
-        if action == "start":
-            subprocess.run(["docker-compose", "start"], cwd=site_dir, check=True)
-            cursor.execute(
-                "UPDATE wordpress_sites SET status = ? WHERE id = ?",
-                ("running", site_id),
-            )
-
-        elif action == "stop":
-            subprocess.run(["docker-compose", "stop"], cwd=site_dir, check=True)
-            cursor.execute(
-                "UPDATE wordpress_sites SET status = ? WHERE id = ?",
-                ("stopped", site_id),
-            )
-
-        elif action == "restart":
-            subprocess.run(["docker-compose", "restart"], cwd=site_dir, check=True)
-            cursor.execute(
-                "UPDATE wordpress_sites SET status = ? WHERE id = ?",
-                ("running", site_id),
-            )
-
-        elif action == "delete":
-            # Stop and remove containers
-            subprocess.run(["docker-compose", "down", "-v"], cwd=site_dir, check=True)
-
-            # Delete from database
-            cursor.execute("DELETE FROM wordpress_sites WHERE id = ?", (site_id,))
-
-            # Remove directory
-            import shutil
-
-            shutil.rmtree(site_dir, ignore_errors=True)
-
-        else:
-            raise Exception(f"Unknown action: {action}")
-
-        # Log action
         cursor.execute(
             """
             INSERT INTO deployment_logs (domain_name, action, status, message)
-            VALUES (?, ?, 'success', ?)
+            VALUES (?, 'wordpress_deploy', 'success', ?)
         """,
-            (site_name, f"wordpress_{action}", f"Action {action} completed"),
+            (domain, f"WordPress site deployed: {site_name}"),
         )
 
         conn.commit()
         conn.close()
 
-        logger.info(f"✅ Action {action} completed for {site_name}")
-        return {"success": True, "action": action}
+        logger.info(f"✅ WordPress site deployed successfully: {site_name}")
+
+        return {
+            "success": True,
+            "site_id": site_id,
+            "site_name": site_name,
+            "domain": domain,
+            "admin_url": f"http://{domain}/wp-admin",
+            "site_url": f"http://{domain}",
+            "admin_user": "admin",
+            "site_dir": str(site_dir),
+            "database": db_name,
+        }
 
     except Exception as e:
-        conn.close()
-        logger.error(f"Management action failed: {e}")
+        logger.error(f"Deployment failed: {e}")
+        # Cleanup on failure
+        cleanup_wordpress_site(site_name)
         raise
+
+
+def cleanup_wordpress_site(site_name):
+    """Complete cleanup of WordPress site"""
+    logger.info(f"Cleaning up WordPress site: {site_name}")
+
+    try:
+        # Get database info
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT mysql_database, mysql_user FROM wordpress_sites WHERE site_name = ?",
+            (site_name,),
+        )
+        result = cursor.fetchone()
+
+        if result:
+            db_name, db_user = result
+            delete_mysql_database(db_name, db_user)
+
+        # Delete from database
+        cursor.execute("DELETE FROM wordpress_sites WHERE site_name = ?", (site_name,))
+        conn.commit()
+        conn.close()
+
+    except Exception as e:
+        logger.warning(f"Database cleanup warning: {e}")
+
+    # Delete PHP-FPM pool
+    try:
+        delete_php_fpm_pool(site_name)
+    except Exception as e:
+        logger.warning(f"PHP-FPM cleanup warning: {e}")
+
+    # Delete nginx config
+    try:
+        delete_nginx_config(site_name)
+    except Exception as e:
+        logger.warning(f"Nginx cleanup warning: {e}")
+
+    # Delete files
+    site_dir = WORDPRESS_BASE_DIR / site_name
+    if site_dir.exists():
+        shutil.rmtree(site_dir, ignore_errors=True)
+
+    logger.info(f"✅ Cleanup complete for {site_name}")
+
+
+# ============================================================================
+# WooCommerce Deployment
+# ============================================================================
+
+
+def deploy_woocommerce_site(
+    site_name, domain, admin_email, admin_password, site_title, store_config
+):
+    """
+    Deploy WordPress + WooCommerce
+
+    Args:
+        store_config: dict with store settings
+    """
+    logger.info(f"🛒 Deploying WooCommerce site: {site_name}")
+
+    # Deploy WordPress first
+    result = deploy_wordpress_site(
+        site_name, domain, admin_email, admin_password, site_title
+    )
+
+    site_dir = WORDPRESS_BASE_DIR / site_name
+
+    try:
+        # Install WooCommerce
+        logger.info("Installing WooCommerce...")
+        run_command(
+            [
+                "wp",
+                "plugin",
+                "install",
+                "woocommerce",
+                "--activate",
+                f"--path={site_dir}",
+                "--allow-root",
+            ]
+        )
+
+        # Configure WooCommerce
+        logger.info("Configuring WooCommerce...")
+
+        # Set store address
+        if store_config.get("store_address"):
+            run_command(
+                [
+                    "wp",
+                    "option",
+                    "update",
+                    "woocommerce_store_address",
+                    store_config["store_address"],
+                    f"--path={site_dir}",
+                    "--allow-root",
+                ]
+            )
+
+        # Set store city
+        if store_config.get("store_city"):
+            run_command(
+                [
+                    "wp",
+                    "option",
+                    "update",
+                    "woocommerce_store_city",
+                    store_config["store_city"],
+                    f"--path={site_dir}",
+                    "--allow-root",
+                ]
+            )
+
+        # Set store country
+        if store_config.get("store_country"):
+            run_command(
+                [
+                    "wp",
+                    "option",
+                    "update",
+                    "woocommerce_default_country",
+                    store_config["store_country"],
+                    f"--path={site_dir}",
+                    "--allow-root",
+                ]
+            )
+
+        # Set currency
+        if store_config.get("currency"):
+            run_command(
+                [
+                    "wp",
+                    "option",
+                    "update",
+                    "woocommerce_currency",
+                    store_config["currency"],
+                    f"--path={site_dir}",
+                    "--allow-root",
+                ]
+            )
+
+        # Create sample products if requested
+        if store_config.get("create_sample_products"):
+            count = store_config.get("sample_product_count", 5)
+            logger.info(f"Creating {count} sample products...")
+
+            for i in range(1, count + 1):
+                run_command(
+                    [
+                        "wp",
+                        "wc",
+                        "product",
+                        "create",
+                        f"--name=Sample Product {i}",
+                        f"--regular_price={100 * i}",
+                        "--type=simple",
+                        f"--path={site_dir}",
+                        "--allow-root",
+                    ]
+                )
+
+        result["woocommerce"] = {"installed": True, "shop_url": f"http://{domain}/shop"}
+
+        logger.info(f"✅ WooCommerce site deployed successfully")
+        return result
+
+    except Exception as e:
+        logger.error(f"WooCommerce setup failed: {e}")
+        cleanup_wordpress_site(site_name)
+        raise
+
+
+# ============================================================================
+# Site Management
+# ============================================================================
 
 
 def list_wordpress_sites():
@@ -642,7 +679,7 @@ def list_wordpress_sites():
 
     cursor.execute(
         """
-        SELECT id, site_name, domain, port, status, admin_email, created_at
+        SELECT id, site_name, domain, status, admin_email, created_at
         FROM wordpress_sites
         ORDER BY created_at DESC
     """
@@ -655,11 +692,11 @@ def list_wordpress_sites():
                 "id": row[0],
                 "name": row[1],
                 "domain": row[2],
-                "port": row[3],
-                "status": row[4],
-                "admin_email": row[5],
-                "created_at": row[6],
+                "status": row[3],
+                "admin_email": row[4],
+                "created_at": row[5],
                 "admin_url": f"http://{row[2]}/wp-admin",
+                "type": "traditional",
             }
         )
 
@@ -667,35 +704,16 @@ def list_wordpress_sites():
     return sites
 
 
-def install_plugin(site_name, plugin_name, activate=True):
-    """Install a WordPress plugin"""
-    logger.info(f"Installing plugin {plugin_name} on {site_name}")
+def execute_wp_cli(site_name, command):
+    """Execute WP-CLI command"""
+    site_dir = WORDPRESS_BASE_DIR / site_name
 
-    # Install plugin
-    cmd = f"plugin install {plugin_name}"
-    if activate:
-        cmd += " --activate"
+    cmd = ["wp"] + command.split() + [f"--path={site_dir}", "--allow-root"]
 
-    result = execute_wp_cli(site_name, cmd)
+    result = run_command(cmd, check=False)
 
-    if result["success"]:
-        # Save to database
-        conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT id FROM wordpress_sites WHERE site_name = ?", (site_name,)
-        )
-        site_id = cursor.fetchone()[0]
-
-        cursor.execute(
-            """
-            INSERT OR REPLACE INTO wordpress_plugins (site_id, plugin_name, is_active)
-            VALUES (?, ?, ?)
-        """,
-            (site_id, plugin_name, activate),
-        )
-
-        conn.commit()
-        conn.close()
-
-    return result
+    return {
+        "success": result.returncode == 0,
+        "output": result.stdout,
+        "error": result.stderr,
+    }
