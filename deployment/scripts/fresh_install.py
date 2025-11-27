@@ -2,6 +2,7 @@
 """
 Hosting Manager - Fresh Server Installation (Docker-Free)
 Pure server blocks + PM2 for Next.js, PHP-FPM for WordPress
+FIXED: MySQL auth for Ubuntu 24.04
 """
 
 import argparse
@@ -184,25 +185,38 @@ echo "PM2: $(pm2 --version)"
 echo "✅ Node.js + PM2 installed"
 
 # ═══════════════════════════════════════════════════════════
-# STEP 7: Install MySQL Server
+# STEP 7: Install MySQL Server (FIXED for Ubuntu 24.04)
 # ═══════════════════════════════════════════════════════════
 echo "[7/11] Installing MySQL server..."
 DEBIAN_FRONTEND=noninteractive apt-get install -y mysql-server
 systemctl start mysql
 systemctl enable mysql
 
-# Secure MySQL
+# Generate secure password
 MYSQL_ROOT_PASS="SecureRootPass$(openssl rand -base64 12)"
-mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASS';"
-mysql -e "DELETE FROM mysql.user WHERE User='';"
-mysql -e "DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');"
-mysql -e "DROP DATABASE IF EXISTS test;"
-mysql -e "DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';"
-mysql -e "FLUSH PRIVILEGES;"
+
+# Ubuntu 24.04: MySQL root uses auth_socket, no password needed initially
+# Connect without password (as root user), then set password
+mysql << MYSQL_SETUP
+ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASS';
+DELETE FROM mysql.user WHERE User='';
+DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+DROP DATABASE IF EXISTS test;
+DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
+FLUSH PRIVILEGES;
+MYSQL_SETUP
 
 # Save password
 echo "$MYSQL_ROOT_PASS" > /root/.mysql_root_password
 chmod 600 /root/.mysql_root_password
+
+# Create .my.cnf for convenient access
+cat > /root/.my.cnf << MYCNF
+[client]
+user=root
+password=$MYSQL_ROOT_PASS
+MYCNF
+chmod 600 /root/.my.cnf
 
 echo "✅ MySQL server installed"
 echo "   Root password saved to: /root/.mysql_root_password"
@@ -387,9 +401,7 @@ echo ""
             if self.root_password:
                 ssh_cmd = f"sshpass -p '{self.root_password}' ssh -o StrictHostKeyChecking=no root@{self.server} 'bash -s'"
             else:
-                ssh_cmd = (
-                    f"ssh -o StrictHostKeyChecking=no root@{self.server} 'bash -s'"
-                )
+                ssh_cmd = f"ssh -o StrictHostKeyChecking=no root@{self.server} 'bash -s'"
 
             process = subprocess.Popen(
                 ssh_cmd,
