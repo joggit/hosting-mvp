@@ -2,6 +2,8 @@
 WordPress deployment and management service - TRADITIONAL APPROACH
 No Docker - uses shared MySQL, PHP-FPM pools, and nginx server blocks
 Like the Next.js deployment but for WordPress
+
+UPDATED: Function names match routes expectations
 """
 
 import os
@@ -19,10 +21,31 @@ logger = logging.getLogger(__name__)
 WORDPRESS_BASE_DIR = Path("/var/www/wordpress")
 NGINX_SITES_AVAILABLE = Path("/etc/nginx/sites-available")
 NGINX_SITES_ENABLED = Path("/etc/nginx/sites-enabled")
-PHP_FPM_POOL_DIR = Path("/etc/php/8.3/fpm/pool.d")  # Adjust version as needed
+PHP_FPM_POOL_DIR = Path("/etc/php/8.3/fpm/pool.d")
 MYSQL_HOST = "localhost"
 MYSQL_ROOT_USER = "root"
-MYSQL_ROOT_PASSWORD = os.environ.get("MYSQL_ROOT_PASSWORD", "root_password")
+
+# Get MySQL root password from environment or file
+def get_mysql_root_password():
+    """Get MySQL root password from environment or file"""
+    password = os.environ.get("MYSQL_ROOT_PASSWORD")
+    if password:
+        return password
+    
+    password_file = Path("/root/.mysql_root_password")
+    if password_file.exists():
+        return password_file.read_text().strip()
+    
+    mycnf = Path("/root/.my.cnf")
+    if mycnf.exists():
+        for line in mycnf.read_text().splitlines():
+            if line.startswith("password="):
+                return line.split("=", 1)[1].strip()
+    
+    logger.warning("MySQL root password not found, using default")
+    return "root_password_change_this"
+
+MYSQL_ROOT_PASSWORD = get_mysql_root_password()
 
 
 # ============================================================================
@@ -53,18 +76,25 @@ def run_command(cmd, shell=False, check=True, **kwargs):
 
 def run_mysql_query(query, database=None):
     """Execute MySQL query"""
-    cmd = [
-        "mysql",
-        "-u",
-        MYSQL_ROOT_USER,
-        f"-p{MYSQL_ROOT_PASSWORD}",
-    ]
-
+    # Check if we have .my.cnf (preferred method)
+    mycnf = Path("/root/.my.cnf")
+    
+    if mycnf.exists():
+        # Use .my.cnf for authentication
+        cmd = ["mysql"]
+    else:
+        # Use password from environment
+        cmd = [
+            "mysql",
+            "-u", MYSQL_ROOT_USER,
+            f"-p{MYSQL_ROOT_PASSWORD}",
+        ]
+    
     if database:
         cmd.extend(["-D", database])
-
+    
     cmd.extend(["-e", query])
-
+    
     result = run_command(cmd, check=True)
     return result.stdout
 
@@ -78,12 +108,10 @@ def create_mysql_database(db_name, db_user, db_password):
     """Create MySQL database and user"""
     logger.info(f"Creating MySQL database: {db_name}")
 
-    # Create database
     run_mysql_query(
         f"CREATE DATABASE IF NOT EXISTS `{db_name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
     )
 
-    # Create user and grant privileges
     run_mysql_query(
         f"""
         CREATE USER IF NOT EXISTS '{db_user}'@'localhost' IDENTIFIED BY '{db_password}';
@@ -139,7 +167,6 @@ php_value[session.save_path] = /var/lib/php/sessions
     pool_file = PHP_FPM_POOL_DIR / f"{site_name}.conf"
     pool_file.write_text(pool_config)
 
-    # Reload PHP-FPM
     run_command("systemctl reload php8.3-fpm", shell=True)
 
     logger.info(f"✅ PHP-FPM pool created: {site_name}")
@@ -214,17 +241,14 @@ def create_nginx_config(site_name, domain):
 }}
 """
 
-    # Write config
     config_file = NGINX_SITES_AVAILABLE / f"{site_name}.conf"
     config_file.write_text(nginx_config)
 
-    # Enable site
     enabled_link = NGINX_SITES_ENABLED / f"{site_name}.conf"
     if enabled_link.exists():
         enabled_link.unlink()
     enabled_link.symlink_to(config_file)
 
-    # Test and reload nginx
     test_result = run_command("nginx -t", shell=True, check=False)
     if test_result.returncode == 0:
         run_command("systemctl reload nginx", shell=True)
@@ -261,16 +285,13 @@ def download_wordpress(site_dir):
 
     site_dir.mkdir(parents=True, exist_ok=True)
 
-    # Download WordPress
     wp_zip = site_dir.parent / "wordpress.tar.gz"
     run_command(
         ["wget", "https://wordpress.org/latest.tar.gz", "-O", str(wp_zip), "-q"]
     )
 
-    # Extract
     run_command(["tar", "xzf", str(wp_zip), "-C", str(site_dir.parent)])
 
-    # Move files from wordpress/ subdirectory to site root
     wp_temp = site_dir.parent / "wordpress"
     for item in wp_temp.iterdir():
         shutil.move(str(item), str(site_dir))
@@ -292,13 +313,11 @@ def create_wp_config(site_dir, db_name, db_user, db_password, domain):
 
     config_content = wp_config_sample.read_text()
 
-    # Replace database settings
     config_content = config_content.replace("database_name_here", db_name)
     config_content = config_content.replace("username_here", db_user)
     config_content = config_content.replace("password_here", db_password)
     config_content = config_content.replace("localhost", MYSQL_HOST)
 
-    # Generate salts
     salts = {
         "AUTH_KEY": generate_password(64),
         "SECURE_AUTH_KEY": generate_password(64),
@@ -315,7 +334,6 @@ def create_wp_config(site_dir, db_name, db_user, db_password, domain):
             f"put your unique phrase here", value, 1
         )
 
-    # Add custom settings
     custom_settings = f"""
 // Custom Settings
 define('WP_HOME', 'http://{domain}');
@@ -324,7 +342,6 @@ define('WP_MEMORY_LIMIT', '256M');
 define('WP_MAX_MEMORY_LIMIT', '512M');
 """
 
-    # Insert before "That's all"
     config_content = config_content.replace(
         "/* That's all, stop editing!",
         custom_settings + "\n/* That's all, stop editing!",
@@ -340,7 +357,6 @@ def install_wordpress_core(
     """Install WordPress using WP-CLI"""
     logger.info("Installing WordPress core...")
 
-    # Download WP-CLI if not exists
     wpcli = Path("/usr/local/bin/wp")
     if not wpcli.exists():
         logger.info("Downloading WP-CLI...")
@@ -354,7 +370,6 @@ def install_wordpress_core(
         run_command(["chmod", "+x", "wp-cli.phar"])
         run_command(["mv", "wp-cli.phar", str(wpcli)])
 
-    # Install WordPress
     result = run_command(
         [
             "wp",
@@ -390,21 +405,21 @@ def set_permissions(site_dir):
 
 
 # ============================================================================
-# Main WordPress Deployment
+# Main WordPress Deployment - RENAMED to match routes
 # ============================================================================
 
 
-def deploy_wordpress_site(
-    site_name, domain, admin_email, admin_password, site_title="My WordPress Site"
+def create_wordpress_site(
+    site_name, domain, admin_email, admin_password, site_title="My WordPress Site", port=None
 ):
     """
     Deploy a WordPress site using traditional hosting approach
+    (port parameter for compatibility with routes, but not used)
 
     Returns: dict with site details
     """
     logger.info(f"🚀 Deploying WordPress site: {site_name}")
 
-    # Generate database credentials
     db_name = f"wp_{site_name}"
     db_user = f"wp_{site_name}"
     db_password = generate_password()
@@ -412,30 +427,16 @@ def deploy_wordpress_site(
     site_dir = WORDPRESS_BASE_DIR / site_name
 
     try:
-        # 1. Create MySQL database
         create_mysql_database(db_name, db_user, db_password)
-
-        # 2. Download WordPress
         download_wordpress(site_dir)
-
-        # 3. Create wp-config.php
         create_wp_config(site_dir, db_name, db_user, db_password, domain)
-
-        # 4. Create PHP-FPM pool
         create_php_fpm_pool(site_name)
-
-        # 5. Create nginx config
         create_nginx_config(site_name, domain)
-
-        # 6. Set permissions
         set_permissions(site_dir)
-
-        # 7. Install WordPress
         install_wordpress_core(
             site_dir, site_title, "admin", admin_password, admin_email, domain
         )
 
-        # 8. Save to database
         conn = get_db()
         cursor = conn.cursor()
 
@@ -488,9 +489,65 @@ def deploy_wordpress_site(
 
     except Exception as e:
         logger.error(f"Deployment failed: {e}")
-        # Cleanup on failure
         cleanup_wordpress_site(site_name)
         raise
+
+
+# ============================================================================
+# Site Management Functions - ADDED to match routes
+# ============================================================================
+
+
+def manage_wordpress_site(site_name, action):
+    """
+    Manage WordPress site (start, stop, restart, delete)
+    For traditional setup, most actions are handled by systemd/php-fpm
+    """
+    logger.info(f"Managing site {site_name}: {action}")
+    
+    if action == "delete":
+        cleanup_wordpress_site(site_name)
+        return {"success": True, "message": f"Site {site_name} deleted"}
+    
+    elif action == "restart":
+        # Reload PHP-FPM and nginx
+        run_command("systemctl reload php8.3-fpm", shell=True)
+        run_command("systemctl reload nginx", shell=True)
+        return {"success": True, "message": f"Site {site_name} restarted (PHP-FPM and Nginx reloaded)"}
+    
+    elif action in ["start", "stop"]:
+        # For traditional setup, sites are always "running" if PHP-FPM is running
+        return {
+            "success": True, 
+            "message": f"Action {action} not needed for traditional WordPress (always active via PHP-FPM)"
+        }
+    
+    else:
+        return {"success": False, "error": f"Unknown action: {action}"}
+
+
+def install_plugin(site_name, plugin_name, activate=True):
+    """Install WordPress plugin using WP-CLI"""
+    logger.info(f"Installing plugin {plugin_name} on {site_name}")
+    
+    site_dir = WORDPRESS_BASE_DIR / site_name
+    
+    cmd = [
+        "wp", "plugin", "install", plugin_name,
+        f"--path={site_dir}",
+        "--allow-root"
+    ]
+    
+    if activate:
+        cmd.append("--activate")
+    
+    result = run_command(cmd, check=False)
+    
+    return {
+        "success": result.returncode == 0,
+        "output": result.stdout,
+        "error": result.stderr if result.returncode != 0 else None
+    }
 
 
 def cleanup_wordpress_site(site_name):
@@ -498,7 +555,6 @@ def cleanup_wordpress_site(site_name):
     logger.info(f"Cleaning up WordPress site: {site_name}")
 
     try:
-        # Get database info
         conn = get_db()
         cursor = conn.cursor()
         cursor.execute(
@@ -511,7 +567,6 @@ def cleanup_wordpress_site(site_name):
             db_name, db_user = result
             delete_mysql_database(db_name, db_user)
 
-        # Delete from database
         cursor.execute("DELETE FROM wordpress_sites WHERE site_name = ?", (site_name,))
         conn.commit()
         conn.close()
@@ -519,157 +574,21 @@ def cleanup_wordpress_site(site_name):
     except Exception as e:
         logger.warning(f"Database cleanup warning: {e}")
 
-    # Delete PHP-FPM pool
     try:
         delete_php_fpm_pool(site_name)
     except Exception as e:
         logger.warning(f"PHP-FPM cleanup warning: {e}")
 
-    # Delete nginx config
     try:
         delete_nginx_config(site_name)
     except Exception as e:
         logger.warning(f"Nginx cleanup warning: {e}")
 
-    # Delete files
     site_dir = WORDPRESS_BASE_DIR / site_name
     if site_dir.exists():
         shutil.rmtree(site_dir, ignore_errors=True)
 
     logger.info(f"✅ Cleanup complete for {site_name}")
-
-
-# ============================================================================
-# WooCommerce Deployment
-# ============================================================================
-
-
-def deploy_woocommerce_site(
-    site_name, domain, admin_email, admin_password, site_title, store_config
-):
-    """
-    Deploy WordPress + WooCommerce
-
-    Args:
-        store_config: dict with store settings
-    """
-    logger.info(f"🛒 Deploying WooCommerce site: {site_name}")
-
-    # Deploy WordPress first
-    result = deploy_wordpress_site(
-        site_name, domain, admin_email, admin_password, site_title
-    )
-
-    site_dir = WORDPRESS_BASE_DIR / site_name
-
-    try:
-        # Install WooCommerce
-        logger.info("Installing WooCommerce...")
-        run_command(
-            [
-                "wp",
-                "plugin",
-                "install",
-                "woocommerce",
-                "--activate",
-                f"--path={site_dir}",
-                "--allow-root",
-            ]
-        )
-
-        # Configure WooCommerce
-        logger.info("Configuring WooCommerce...")
-
-        # Set store address
-        if store_config.get("store_address"):
-            run_command(
-                [
-                    "wp",
-                    "option",
-                    "update",
-                    "woocommerce_store_address",
-                    store_config["store_address"],
-                    f"--path={site_dir}",
-                    "--allow-root",
-                ]
-            )
-
-        # Set store city
-        if store_config.get("store_city"):
-            run_command(
-                [
-                    "wp",
-                    "option",
-                    "update",
-                    "woocommerce_store_city",
-                    store_config["store_city"],
-                    f"--path={site_dir}",
-                    "--allow-root",
-                ]
-            )
-
-        # Set store country
-        if store_config.get("store_country"):
-            run_command(
-                [
-                    "wp",
-                    "option",
-                    "update",
-                    "woocommerce_default_country",
-                    store_config["store_country"],
-                    f"--path={site_dir}",
-                    "--allow-root",
-                ]
-            )
-
-        # Set currency
-        if store_config.get("currency"):
-            run_command(
-                [
-                    "wp",
-                    "option",
-                    "update",
-                    "woocommerce_currency",
-                    store_config["currency"],
-                    f"--path={site_dir}",
-                    "--allow-root",
-                ]
-            )
-
-        # Create sample products if requested
-        if store_config.get("create_sample_products"):
-            count = store_config.get("sample_product_count", 5)
-            logger.info(f"Creating {count} sample products...")
-
-            for i in range(1, count + 1):
-                run_command(
-                    [
-                        "wp",
-                        "wc",
-                        "product",
-                        "create",
-                        f"--name=Sample Product {i}",
-                        f"--regular_price={100 * i}",
-                        "--type=simple",
-                        f"--path={site_dir}",
-                        "--allow-root",
-                    ]
-                )
-
-        result["woocommerce"] = {"installed": True, "shop_url": f"http://{domain}/shop"}
-
-        logger.info(f"✅ WooCommerce site deployed successfully")
-        return result
-
-    except Exception as e:
-        logger.error(f"WooCommerce setup failed: {e}")
-        cleanup_wordpress_site(site_name)
-        raise
-
-
-# ============================================================================
-# Site Management
-# ============================================================================
 
 
 def list_wordpress_sites():
@@ -716,4 +635,91 @@ def execute_wp_cli(site_name, command):
         "success": result.returncode == 0,
         "output": result.stdout,
         "error": result.stderr,
+    }
+
+
+# ============================================================================
+# WooCommerce Support - ADDED to match routes expectations
+# ============================================================================
+
+
+def setup_woocommerce(site_name, config):
+    """Setup WooCommerce on existing WordPress site"""
+    logger.info(f"Setting up WooCommerce on {site_name}")
+    
+    site_dir = WORDPRESS_BASE_DIR / site_name
+    
+    # Install WooCommerce
+    run_command([
+        "wp", "plugin", "install", "woocommerce", "--activate",
+        f"--path={site_dir}", "--allow-root"
+    ])
+    
+    # Configure store settings
+    settings = {
+        "woocommerce_store_address": config.get("store_address", ""),
+        "woocommerce_store_city": config.get("store_city", ""),
+        "woocommerce_store_postcode": config.get("store_postcode", ""),
+        "woocommerce_default_country": config.get("store_country", "ZA"),
+        "woocommerce_currency": config.get("currency", "ZAR"),
+    }
+    
+    for option, value in settings.items():
+        if value:
+            run_command([
+                "wp", "option", "update", option, str(value),
+                f"--path={site_dir}", "--allow-root"
+            ])
+    
+    return {
+        "success": True,
+        "message": "WooCommerce installed and configured",
+        "steps_completed": ["plugin_install", "configuration"]
+    }
+
+
+def create_sample_products(site_name, count=5):
+    """Create sample WooCommerce products"""
+    logger.info(f"Creating {count} sample products for {site_name}")
+    
+    site_dir = WORDPRESS_BASE_DIR / site_name
+    created = 0
+    
+    for i in range(1, count + 1):
+        try:
+            run_command([
+                "wp", "wc", "product", "create",
+                f"--name=Sample Product {i}",
+                f"--regular_price={100 * i}",
+                "--type=simple",
+                f"--path={site_dir}",
+                "--allow-root"
+            ])
+            created += 1
+        except Exception as e:
+            logger.warning(f"Failed to create product {i}: {e}")
+    
+    return {
+        "success": True,
+        "products_created": created,
+        "message": f"Created {created} sample products"
+    }
+
+
+def get_store_info(site_name):
+    """Get WooCommerce store information"""
+    site_dir = WORDPRESS_BASE_DIR / site_name
+    
+    # Check if WooCommerce is active
+    result = run_command([
+        "wp", "plugin", "is-active", "woocommerce",
+        f"--path={site_dir}", "--allow-root"
+    ], check=False)
+    
+    woo_active = result.returncode == 0
+    
+    return {
+        "success": True,
+        "woocommerce_active": woo_active,
+        "site_name": site_name
     }
