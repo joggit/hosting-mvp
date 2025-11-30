@@ -185,45 +185,111 @@ echo "PM2: $(pm2 --version)"
 echo "✅ Node.js + PM2 installed"
 
 # ═══════════════════════════════════════════════════════════
-# STEP 7: Install MySQL Server (FIXED for Ubuntu 24.04)
+# STEP 7: Install & Secure MySQL Server (Robust for Ubuntu 24.04)
 # ═══════════════════════════════════════════════════════════
-echo "[7/11] Installing MySQL server..."
-DEBIAN_FRONTEND=noninteractive apt-get install -y mysql-server
+echo "[7/11] Installing & securing MySQL server..."
+
+# Install MySQL if not present
+if ! dpkg -l | grep -q "mysql-server"; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y mysql-server
+fi
+
 systemctl start mysql
 systemctl enable mysql
 
-# Generate secure password
-MYSQL_ROOT_PASS="SecureRootPass$(openssl rand -base64 12)"
+# Generate a strong password (only once)
+MYSQL_ROOT_PASS=""
+MYSQL_PASS_FILE="/root/.mysql_root_password"
+SECURE_PASS_FILE="/etc/hosting-manager/mysql_root_password"
 
-# Ubuntu 24.04: MySQL root uses auth_socket, no password needed initially
-# Connect without password (as root user), then set password
-mysql << MYSQL_SETUP
+# Try to get existing password first
+if [ -f "$MYSQL_PASS_FILE" ]; then
+    MYSQL_ROOT_PASS=$(cat "$MYSQL_PASS_FILE")
+    echo "✅ Using existing MySQL root password from $MYSQL_PASS_FILE"
+elif [ -f "/root/.my.cnf" ]; then
+    # Extract from .my.cnf
+    MYSQL_ROOT_PASS=$(grep '^password=' /root/.my.cnf 2>/dev/null | cut -d= -f2)
+    if [ -n "$MYSQL_ROOT_PASS" ]; then
+        echo "✅ Extracted MySQL password from /root/.my.cnf"
+    fi
+fi
+
+# If still no password, probe MySQL access method
+if [ -z "$MYSQL_ROOT_PASS" ]; then
+    if mysql -e "SELECT 1;" 2>/dev/null; then
+        # MySQL allows passwordless root (auth_socket), so set one
+        MYSQL_ROOT_PASS="SecureRootPass$(openssl rand -base64 12 | tr -dc 'A-Za-z0-9' | head -c 16)"
+        echo "🔧 Setting new MySQL root password (was using auth_socket)..."
+        mysql << MYSQL_SETUP
 ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASS';
+FLUSH PRIVILEGES;
+MYSQL_SETUP
+        echo "✅ MySQL root password set."
+    else
+        # Truly fresh — generate and apply
+        MYSQL_ROOT_PASS="SecureRootPass$(openssl rand -base64 12 | tr -dc 'A-Za-z0-9' | head -c 16)"
+        echo "🔧 Configuring fresh MySQL root password..."
+        # Try common paths for mysqld_safe or system init
+        if [ -x "/usr/bin/mysqld_safe" ]; then
+            systemctl stop mysql
+            mysqld_safe --skip-grant-tables &
+            sleep 5
+            mysql << RESET_PASS
+FLUSH PRIVILEGES;
+ALTER USER 'root'@'localhost' IDENTIFIED BY '$MYSQL_ROOT_PASS';
+FLUSH PRIVILEGES;
+exit
+RESET_PASS
+            pkill mysqld_safe
+            systemctl start mysql
+        else
+            # Fallback: reinstall config
+            sudo debconf-set-selections <<< "mysql-server mysql-server/root_password password $MYSQL_ROOT_PASS"
+            sudo debconf-set-selections <<< "mysql-server mysql-server/root_password_again password $MYSQL_ROOT_PASS"
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall mysql-server
+        fi
+    fi
+fi
+
+# Ensure password is saved securely in both locations
+mkdir -p /etc/hosting-manager
+echo "$MYSQL_ROOT_PASS" > "$MYSQL_PASS_FILE"
+echo "$MYSQL_ROOT_PASS" > "$SECURE_PASS_FILE"
+
+chmod 600 "$MYSQL_PASS_FILE"
+chmod 640 "$SECURE_PASS_FILE"
+
+# Ensure 'hosting' group exists and owns the secure file
+groupadd hosting 2>/dev/null || true
+chown root:hosting "$SECURE_PASS_FILE"
+
+# Optional: Add 'deploy' to hosting group if user exists
+if id "deploy" &>/dev/null; then
+    usermod -aG hosting deploy
+fi
+
+# Create .my.cnf for root convenience
+cat > /root/.my.cnf << MYCNF
+[client]
+user=root
+password=$MYSQL_ROOT_PASS
+host=localhost
+MYCNF
+chmod 600 /root/.my.cnf
+
+# Final security hardening
+mysql << MYSQL_HARDEN
 DELETE FROM mysql.user WHERE User='';
 DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
 DROP DATABASE IF EXISTS test;
 DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
 FLUSH PRIVILEGES;
-MYSQL_SETUP
+MYSQL_HARDEN
 
-# Save password securely (accessible to 'deploy' and 'root')
-mkdir -p /etc/hosting-manager
-echo "$MYSQL_ROOT_PASS" > /etc/hosting-manager/mysql_root_password
-chown {self.username}:www-data /etc/hosting-manager/mysql_root_password
-chmod 640 /etc/hosting-manager/mysql_root_password
-
-
-# Create .my.cnf for convenient access
-cat > /root/.my.cnf << MYCNF
-[client]
-user=root
-password=$MYSQL_ROOT_PASS
-MYCNF
-chmod 600 /root/.my.cnf
-
-echo "✅ MySQL server installed"
-echo "   Root password saved to: /root/.mysql_root_password"
-
+echo "✅ MySQL server secured"
+echo "   🔑 Root password saved to:"
+echo "      - /root/.mysql_root_password (600, root)"
+echo "      - /etc/hosting-manager/mysql_root_password (640, root:hosting)"
 # ═══════════════════════════════════════════════════════════
 # STEP 8: Install PHP and PHP-FPM
 # ═══════════════════════════════════════════════════════════
