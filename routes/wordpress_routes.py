@@ -182,6 +182,7 @@ def get_wordpress_templates():
                 ],
                 "theme": "storefront",
                 "plugin_count": 6,
+                
             },
         ]
 
@@ -744,6 +745,8 @@ def get_moods():
     except Exception as e:
         logger.error(f"Moods request failed: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
+    
+    
 
 
 # ============================================================================

@@ -25,27 +25,68 @@ PHP_FPM_POOL_DIR = Path("/etc/php/8.3/fpm/pool.d")
 MYSQL_HOST = "localhost"
 MYSQL_ROOT_USER = "root"
 
-# Get MySQL root password from environment or file
+
+# ============================================================================
+# Secure MySQL Root Password Retrieval (FIXED)
+# ============================================================================
+
+
 def get_mysql_root_password():
-    """Get MySQL root password from environment or file"""
+    """
+    Get MySQL root password securely.
+    Order of preference:
+      1. Environment variable (for dev)
+      2. /etc/hosting-manager/mysql_root_password (group: hosting, chmod 640)
+      3. /root/.my.cnf (fallback, but avoided for non-root users)
+    """
+    # 1. Environment (e.g., .env)
     password = os.environ.get("MYSQL_ROOT_PASSWORD")
     if password:
+        logger.debug("MySQL root password loaded from environment")
         return password
-    
-    password_file = Path("/root/.mysql_root_password")
-    if password_file.exists():
-        return password_file.read_text().strip()
-    
-    mycnf = Path("/root/.my.cnf")
-    if mycnf.exists():
-        for line in mycnf.read_text().splitlines():
-            if line.startswith("password="):
-                return line.split("=", 1)[1].strip()
-    
-    logger.warning("MySQL root password not found, using default")
-    return "root_password_change_this"
 
-MYSQL_ROOT_PASSWORD = get_mysql_root_password()
+    # 2. Secure shared location (recommended for production)
+    secure_path = Path("/etc/hosting-manager/mysql_root_password")
+    if secure_path.exists():
+        try:
+            # This file should be owned by root:hosting, chmod 640
+            return secure_path.read_text().strip()
+        except PermissionError:
+            logger.warning(
+                f"Permission denied reading {secure_path} — ensure 'deploy' is in 'hosting' group"
+            )
+            raise
+        except Exception as e:
+            logger.error(f"Failed to read {secure_path}: {e}")
+
+    # 3. Fallback: /root/.my.cnf (only works if running as root)
+    mycnf = Path("/root/.my.cnf")
+    if mycnf.exists() and os.geteuid() == 0:
+        try:
+            for line in mycnf.read_text().splitlines():
+                if line.startswith("password="):
+                    return line.split("=", 1)[1].strip()
+        except Exception as e:
+            logger.warning(f"Failed to parse {mycnf}: {e}")
+
+    # Last resort
+    logger.error("❌ MySQL root password not found in any expected location!")
+    logger.error("   Ensure one of the following exists:")
+    logger.error("   - MYSQL_ROOT_PASSWORD in .env")
+    logger.error(
+        "   - /etc/hosting-manager/mysql_root_password (chmod 640, owned by deploy:hosting)"
+    )
+    raise FileNotFoundError(
+        "MySQL root password not found. Check permissions and file locations."
+    )
+
+
+# Load once at runtime (not at import time)
+try:
+    MYSQL_ROOT_PASSWORD = get_mysql_root_password()
+except Exception as e:
+    MYSQL_ROOT_PASSWORD = None
+    logger.warning(f"MySQL password not available yet: {e}. Will retry at runtime.")
 
 
 # ============================================================================
@@ -75,26 +116,26 @@ def run_command(cmd, shell=False, check=True, **kwargs):
 
 
 def run_mysql_query(query, database=None):
-    """Execute MySQL query"""
-    # Check if we have .my.cnf (preferred method)
+    """Execute MySQL query — SAFE: calls get_mysql_root_password() on-demand"""
+    password = get_mysql_root_password()  # lazy load, avoids import-time crash
+
+    # Prefer .my.cnf if available (cleaner auth)
     mycnf = Path("/root/.my.cnf")
-    
     if mycnf.exists():
-        # Use .my.cnf for authentication
         cmd = ["mysql"]
     else:
-        # Use password from environment
         cmd = [
             "mysql",
-            "-u", MYSQL_ROOT_USER,
-            f"-p{MYSQL_ROOT_PASSWORD}",
+            "-u",
+            MYSQL_ROOT_USER,
+            f"-p{password}",
         ]
-    
+
     if database:
         cmd.extend(["-D", database])
-    
+
     cmd.extend(["-e", query])
-    
+
     result = run_command(cmd, check=True)
     return result.stdout
 
@@ -127,9 +168,12 @@ def delete_mysql_database(db_name, db_user):
     """Delete MySQL database and user"""
     logger.info(f"Deleting MySQL database: {db_name}")
 
-    run_mysql_query(f"DROP DATABASE IF EXISTS `{db_name}`;", check=False)
-    run_mysql_query(f"DROP USER IF EXISTS '{db_user}'@'localhost';", check=False)
-    run_mysql_query("FLUSH PRIVILEGES;")
+    try:
+        run_mysql_query(f"DROP DATABASE IF EXISTS `{db_name}`;", check=False)
+        run_mysql_query(f"DROP USER IF EXISTS '{db_user}'@'localhost';", check=False)
+        run_mysql_query("FLUSH PRIVILEGES;")
+    except Exception as e:
+        logger.warning(f"MySQL cleanup warning (non-fatal): {e}")
 
     logger.info(f"✅ Database {db_name} deleted")
 
@@ -410,7 +454,12 @@ def set_permissions(site_dir):
 
 
 def create_wordpress_site(
-    site_name, domain, admin_email, admin_password, site_title="My WordPress Site", port=None
+    site_name,
+    domain,
+    admin_email,
+    admin_password,
+    site_title="My WordPress Site",
+    port=None,
 ):
     """
     Deploy a WordPress site using traditional hosting approach
@@ -504,24 +553,27 @@ def manage_wordpress_site(site_name, action):
     For traditional setup, most actions are handled by systemd/php-fpm
     """
     logger.info(f"Managing site {site_name}: {action}")
-    
+
     if action == "delete":
         cleanup_wordpress_site(site_name)
         return {"success": True, "message": f"Site {site_name} deleted"}
-    
+
     elif action == "restart":
         # Reload PHP-FPM and nginx
         run_command("systemctl reload php8.3-fpm", shell=True)
         run_command("systemctl reload nginx", shell=True)
-        return {"success": True, "message": f"Site {site_name} restarted (PHP-FPM and Nginx reloaded)"}
-    
+        return {
+            "success": True,
+            "message": f"Site {site_name} restarted (PHP-FPM and Nginx reloaded)",
+        }
+
     elif action in ["start", "stop"]:
         # For traditional setup, sites are always "running" if PHP-FPM is running
         return {
-            "success": True, 
-            "message": f"Action {action} not needed for traditional WordPress (always active via PHP-FPM)"
+            "success": True,
+            "message": f"Action {action} not needed for traditional WordPress (always active via PHP-FPM)",
         }
-    
+
     else:
         return {"success": False, "error": f"Unknown action: {action}"}
 
@@ -529,24 +581,20 @@ def manage_wordpress_site(site_name, action):
 def install_plugin(site_name, plugin_name, activate=True):
     """Install WordPress plugin using WP-CLI"""
     logger.info(f"Installing plugin {plugin_name} on {site_name}")
-    
+
     site_dir = WORDPRESS_BASE_DIR / site_name
-    
-    cmd = [
-        "wp", "plugin", "install", plugin_name,
-        f"--path={site_dir}",
-        "--allow-root"
-    ]
-    
+
+    cmd = ["wp", "plugin", "install", plugin_name, f"--path={site_dir}", "--allow-root"]
+
     if activate:
         cmd.append("--activate")
-    
+
     result = run_command(cmd, check=False)
-    
+
     return {
         "success": result.returncode == 0,
         "output": result.stdout,
-        "error": result.stderr if result.returncode != 0 else None
+        "error": result.stderr if result.returncode != 0 else None,
     }
 
 
@@ -646,15 +694,22 @@ def execute_wp_cli(site_name, command):
 def setup_woocommerce(site_name, config):
     """Setup WooCommerce on existing WordPress site"""
     logger.info(f"Setting up WooCommerce on {site_name}")
-    
+
     site_dir = WORDPRESS_BASE_DIR / site_name
-    
+
     # Install WooCommerce
-    run_command([
-        "wp", "plugin", "install", "woocommerce", "--activate",
-        f"--path={site_dir}", "--allow-root"
-    ])
-    
+    run_command(
+        [
+            "wp",
+            "plugin",
+            "install",
+            "woocommerce",
+            "--activate",
+            f"--path={site_dir}",
+            "--allow-root",
+        ]
+    )
+
     # Configure store settings
     settings = {
         "woocommerce_store_address": config.get("store_address", ""),
@@ -663,63 +718,78 @@ def setup_woocommerce(site_name, config):
         "woocommerce_default_country": config.get("store_country", "ZA"),
         "woocommerce_currency": config.get("currency", "ZAR"),
     }
-    
+
     for option, value in settings.items():
         if value:
-            run_command([
-                "wp", "option", "update", option, str(value),
-                f"--path={site_dir}", "--allow-root"
-            ])
-    
+            run_command(
+                [
+                    "wp",
+                    "option",
+                    "update",
+                    option,
+                    str(value),
+                    f"--path={site_dir}",
+                    "--allow-root",
+                ]
+            )
+
     return {
         "success": True,
         "message": "WooCommerce installed and configured",
-        "steps_completed": ["plugin_install", "configuration"]
+        "steps_completed": ["plugin_install", "configuration"],
     }
 
 
 def create_sample_products(site_name, count=5):
     """Create sample WooCommerce products"""
     logger.info(f"Creating {count} sample products for {site_name}")
-    
+
     site_dir = WORDPRESS_BASE_DIR / site_name
     created = 0
-    
+
     for i in range(1, count + 1):
         try:
-            run_command([
-                "wp", "wc", "product", "create",
-                f"--name=Sample Product {i}",
-                f"--regular_price={100 * i}",
-                "--type=simple",
-                f"--path={site_dir}",
-                "--allow-root"
-            ])
+            run_command(
+                [
+                    "wp",
+                    "wc",
+                    "product",
+                    "create",
+                    f"--name=Sample Product {i}",
+                    f"--regular_price={100 * i}",
+                    "--type=simple",
+                    f"--path={site_dir}",
+                    "--allow-root",
+                ]
+            )
             created += 1
         except Exception as e:
             logger.warning(f"Failed to create product {i}: {e}")
-    
+
     return {
         "success": True,
         "products_created": created,
-        "message": f"Created {created} sample products"
+        "message": f"Created {created} sample products",
     }
 
 
 def get_store_info(site_name):
     """Get WooCommerce store information"""
     site_dir = WORDPRESS_BASE_DIR / site_name
-    
+
     # Check if WooCommerce is active
-    result = run_command([
-        "wp", "plugin", "is-active", "woocommerce",
-        f"--path={site_dir}", "--allow-root"
-    ], check=False)
-    
+    result = run_command(
+        [
+            "wp",
+            "plugin",
+            "is-active",
+            "woocommerce",
+            f"--path={site_dir}",
+            "--allow-root",
+        ],
+        check=False,
+    )
+
     woo_active = result.returncode == 0
-    
-    return {
-        "success": True,
-        "woocommerce_active": woo_active,
-        "site_name": site_name
-    }
+
+    return {"success": True, "woocommerce_active": woo_active, "site_name": site_name}

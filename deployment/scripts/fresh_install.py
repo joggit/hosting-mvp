@@ -206,9 +206,12 @@ DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
 FLUSH PRIVILEGES;
 MYSQL_SETUP
 
-# Save password
-echo "$MYSQL_ROOT_PASS" > /root/.mysql_root_password
-chmod 600 /root/.mysql_root_password
+# Save password securely (accessible to 'deploy' and 'root')
+mkdir -p /etc/hosting-manager
+echo "$MYSQL_ROOT_PASS" > /etc/hosting-manager/mysql_root_password
+chown {self.username}:www-data /etc/hosting-manager/mysql_root_password
+chmod 640 /etc/hosting-manager/mysql_root_password
+
 
 # Create .my.cnf for convenient access
 cat > /root/.my.cnf << MYCNF
@@ -401,7 +404,9 @@ echo ""
             if self.root_password:
                 ssh_cmd = f"sshpass -p '{self.root_password}' ssh -o StrictHostKeyChecking=no root@{self.server} 'bash -s'"
             else:
-                ssh_cmd = f"ssh -o StrictHostKeyChecking=no root@{self.server} 'bash -s'"
+                ssh_cmd = (
+                    f"ssh -o StrictHostKeyChecking=no root@{self.server} 'bash -s'"
+                )
 
             process = subprocess.Popen(
                 ssh_cmd,
