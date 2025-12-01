@@ -565,3 +565,73 @@ def get_store_info(site_name):
         "woocommerce_active": result.returncode == 0,
         "site_name": site_name,
     }
+
+
+# Must be run from cli since python scripts cannot modify their own permissions
+def ensure_permissions():
+    """
+    Ensure 'deploy' user has permissions to:
+      - Write to /var/www/wordpress
+      - Write PHP-FPM pool configs via sudo (if configured)
+    Safe for production — no blind sudo.
+    """
+    import grp
+    import pwd
+    import subprocess
+
+    DEPLOY_USER = "deploy"
+    WWW_DIR = Path("/var/www/wordpress")
+    PHP_POOL_DIR = Path("/etc/php/8.3/fpm/pool.d")
+
+    logger.info("🔍 Checking deployment permissions...")
+
+    # 1. Ensure WWW_DIR exists and is group-writable
+    try:
+        WWW_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Set owner:group = www-data:www-data
+        subprocess.run(
+            ["sudo", "chown", "-R", "www-www-data", str(WWW_DIR)], check=True
+        )
+        subprocess.run(["sudo", "chmod", "-R", "755", str(WWW_DIR)], check=True)
+        subprocess.run(["sudo", "chmod", "-R", "g+w", str(WWW_DIR)], check=True)
+
+        # Ensure deploy is in www-data group
+        deploy_groups = grp.getgrnam("www-data")
+        if DEPLOY_USER not in deploy_groups.gr_mem:
+            logger.warning(f"⚠️ User '{DEPLOY_USER}' not in 'www-data' group.")
+            logger.info(f"   Run as root: usermod -aG www-data {DEPLOY_USER}")
+            logger.info(f"   Then re-login or restart the service.")
+            return False
+        else:
+            logger.info("✅ 'deploy' is in 'www-data' group")
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"❌ Failed to set /var/www permissions: {e}")
+        logger.info(
+            "   Ensure 'deploy' has passwordless sudo for chown/chmod/www-data ops."
+        )
+        return False
+
+    # 2. Check sudo access for PHP-FPM pool management
+    try:
+        # Test: can we sudo-copy a dummy file?
+        test_file = Path("/tmp/__perm_test.conf")
+        test_file.write_text("# test")
+        dest = PHP_POOL_DIR / "__perm_test.conf"
+
+        subprocess.run(["sudo", "cp", str(test_file), str(dest)], check=True)
+        subprocess.run(["sudo", "rm", str(dest)], check=True)
+        test_file.unlink()
+
+        logger.info("✅ 'deploy' can manage PHP-FPM pool configs via sudo")
+    except subprocess.CalledProcessError:
+        logger.warning("⚠️ 'deploy' cannot write to /etc/php/... via sudo")
+        logger.info("   Fix: Create /etc/sudoers.d/deploy-php with:")
+        logger.info(
+            f"   {DEPLOY_USER} ALL=(root) NOPASSWD: /bin/cp /tmp/*.conf /etc/php/8.3/fpm/pool.d/, /bin/rm /etc/php/8.3/fpm/pool.d/*.conf, /bin/chown * /etc/php/8.3/fpm/pool.d/*.conf, /bin/chmod * /etc/php/8.3/fpm/pool.d/*.conf"
+        )
+        return False
+
+    logger.info("✅ All permissions OK for WordPress deployment")
+    return True
