@@ -591,7 +591,7 @@ def ensure_permissions():
 
         # Set owner:group = www-data:www-data
         subprocess.run(
-            ["sudo", "chown", "-R", "www-www-data", str(WWW_DIR)], check=True
+            ["sudo", "chown", "-R", "www-data:www-data", str(WWW_DIR)], check=True
         )
         subprocess.run(["sudo", "chmod", "-R", "755", str(WWW_DIR)], check=True)
         subprocess.run(["sudo", "chmod", "-R", "g+w", str(WWW_DIR)], check=True)
