@@ -389,67 +389,53 @@ def download_wordpress(site_dir):
     logger.info("✅ WordPress downloaded and extracted")
 
 
-def create_wp_config(site_dir, db_name, db_user, db_password, domain):
-    """Create wp-config.php file"""
-    wp_config_sample = site_dir / "wp-config-sample.php"
+def create_wp_config(site_dir, db_name, db_user, db_pass, domain):
+    """Create wp-config.php with proper permissions"""
+    wp_config_path = site_dir / "wp-config.php"
 
-    if not wp_config_sample.exists():
-        # Create basic wp-config.php if sample doesn't exist
-        content = f"""<?php
-/**
- * The base configuration for WordPress
- */
+    config_content = f"""<?php
 define('DB_NAME', '{db_name}');
 define('DB_USER', '{db_user}');
-define('DB_PASSWORD', '{db_password}');
-define('DB_HOST', '{MYSQL_HOST}');
-define('DB_CHARSET', 'utf8mb4');
+define('DB_PASSWORD', '{db_pass}');
+define('DB_HOST', 'localhost');
+define('DB_CHARSET', 'utf8');
 define('DB_COLLATE', '');
 
-/** Authentication Unique Keys and Salts */
-define('AUTH_KEY',         '{generate_password(64)}');
-define('SECURE_AUTH_KEY',  '{generate_password(64)}');
-define('LOGGED_IN_KEY',    '{generate_password(64)}');
-define('NONCE_KEY',        '{generate_password(64)}');
-define('AUTH_SALT',        '{generate_password(64)}');
-define('SECURE_AUTH_SALT', '{generate_password(64)}');
-define('LOGGED_IN_SALT',   '{generate_password(64)}');
-define('NONCE_SALT',       '{generate_password(64)}');
+$table_prefix = 'wp_';
 
-/** WordPress Database Table prefix */
-\$table_prefix = 'wp_';
-
-/** WordPress debugging mode */
 define('WP_DEBUG', false);
 
-/** Absolute path to the WordPress directory */
-if ( !defined('ABSPATH') )
+if (!defined('ABSPATH'))
     define('ABSPATH', dirname(__FILE__) . '/');
 
-/** Sets up WordPress vars and included files */
 require_once(ABSPATH . 'wp-settings.php');
 """
-    else:
-        # Use sample file as template
-        content = wp_config_sample.read_text()
-        content = content.replace("database_name_here", db_name)
-        content = content.replace("username_here", db_user)
-        content = content.replace("password_here", db_password)
-        content = content.replace("localhost", MYSQL_HOST)
 
-        # Generate security keys
-        for _ in range(8):
-            content = content.replace(
-                "put your unique phrase here", generate_password(64), 1
-            )
+    # Write to temporary file first
+    import tempfile
 
-    # Write wp-config.php
-    wp_config = site_dir / "wp-config.php"
-    wp_config.write_text(content)
+    temp_file = tempfile.NamedTemporaryFile(mode="w", suffix=".php", delete=False)
+    temp_file.write(config_content)
+    temp_file.close()
 
-    # Set permissions
-    subprocess.run(["sudo", "chmod", "644", str(wp_config)], check=False)
-    logger.info("✅ wp-config.php created")
+    # Copy with sudo to ensure proper ownership
+    import subprocess
+
+    subprocess.run(["sudo", "cp", temp_file.name, str(wp_config_path)], check=True)
+
+    # Set ownership to www-data
+    subprocess.run(
+        ["sudo", "chown", "www-data:www-data", str(wp_config_path)], check=True
+    )
+
+    subprocess.run(["sudo", "chmod", "644", str(wp_config_path)], check=True)
+
+    # Clean up temp file
+    import os
+
+    os.unlink(temp_file.name)
+
+    logger.info(f"✅ Created wp-config.php at {wp_config_path}")
 
 
 def install_wordpress_core(
