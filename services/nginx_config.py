@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 def create_nginx_reverse_proxy(domain, port):
-    """Create nginx reverse proxy configuration"""
+    """Create nginx reverse proxy configuration - FIXED"""
 
     nginx_config = f"""server {{
     listen 80;
@@ -48,9 +48,11 @@ def create_nginx_reverse_proxy(domain, port):
     subprocess.run(["sudo", "rm", "-f", enabled_path], check=False)
     subprocess.run(["sudo", "ln", "-sf", config_path, enabled_path], check=True)
 
-    # Test configuration
+    # Test configuration WITH FULL PATH
     test_result = subprocess.run(
-        ["sudo", "nginx", "-t"], capture_output=True, text=True
+        ["sudo", "/usr/sbin/nginx", "-t"],
+        capture_output=True,
+        text=True,  # CHANGED HERE
     )
 
     if test_result.returncode != 0:
