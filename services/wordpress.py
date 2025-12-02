@@ -15,7 +15,9 @@ import logging
 import secrets
 import string
 import shutil
+import tempfile
 from pathlib import Path
+
 from services.database import get_db
 
 logger = logging.getLogger(__name__)
@@ -158,6 +160,9 @@ def delete_mysql_database(db_name, db_user):
 
 
 def create_php_fpm_pool(site_name, user="www-data", group="www-data"):
+    logger.info(f"Creating PHP-FPM pool for {site_name}")
+
+    # Build config
     pool_config = f"""[{site_name}]
 user = {user}
 group = {group}
@@ -173,9 +178,30 @@ pm.max_spare_servers = 3
 php_admin_value[error_log] = /var/log/php-fpm/{site_name}-error.log
 php_admin_flag[log_errors] = on
 """
-    (PHP_FPM_POOL_DIR / f"{site_name}.conf").write_text(pool_config)
-    run_command("systemctl reload php8.3-fpm", shell=True)
-    logger.info(f"✅ PHP-FPM pool: {site_name}")
+
+    # ✅ Write to /tmp first (safe for 'deploy')
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".conf", delete=False) as tmp:
+        tmp.write(pool_config)
+        tmp_path = tmp.name
+
+    dest_path = f"/etc/php/8.3/fpm/pool.d/{site_name}.conf"
+
+    try:
+        # ✅ Use sudo to copy and set permissions
+        subprocess.run(["sudo", "cp", tmp_path, dest_path], check=True)
+        subprocess.run(["sudo", "chmod", "644", dest_path], check=True)
+        logger.info(f"✅ Pool config installed: {dest_path}")
+
+        # ✅ Reload PHP-FPM (also allowed in sudoers)
+        subprocess.run(["sudo", "systemctl", "reload", "php8.3-fpm"], check=True)
+        logger.info("✅ PHP-FPM reloaded")
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"❌ Failed to install pool config: {e}")
+        raise
+    finally:
+        # Cleanup
+        Path(tmp_path).unlink(missing_ok=True)
 
 
 def delete_php_fpm_pool(site_name):
