@@ -84,10 +84,6 @@ def nginx_command():
     return "nginx"  # fallback
 
 
-# Then use it like:
-nginx_cmd = nginx_command()
-subprocess.run([nginx_cmd, "-t"], ...)
-
 # ═══════════════════════════════════════════════════════════
 # Startup Checks
 # ═══════════════════════════════════════════════════════════
