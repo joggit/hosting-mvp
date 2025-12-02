@@ -340,7 +340,7 @@ def delete_nginx_config(site_name):
 
 
 def download_wordpress(site_dir):
-    """Download and extract WordPress core"""
+    """Download and extract WordPress core - FIXED VERSION"""
     site_dir.mkdir(parents=True, exist_ok=True)
 
     # Download WordPress
@@ -356,16 +356,21 @@ def download_wordpress(site_dir):
     if result.returncode != 0:
         raise Exception(f"Failed to download WordPress: {result.stderr}")
 
-    # Extract WordPress
+    # Extract WordPress WITH FIXED FLAGS
     logger.info("Extracting WordPress...")
     result = subprocess.run(
         [
+            "sudo",
+            "-u",
+            "www-data",  # Run as www-data user
             "tar",
             "-xzf",
             str(wp_zip),
             "-C",
             str(site_dir.parent),
             "--strip-components=1",
+            "--no-same-owner",  # FIX: Don't preserve ownership
+            "--no-same-permissions",  # FIX: Don't preserve setgid permissions
         ],
         capture_output=True,
         text=True,
@@ -373,6 +378,11 @@ def download_wordpress(site_dir):
 
     if result.returncode != 0:
         raise Exception(f"Failed to extract WordPress: {result.stderr}")
+
+    # Fix ownership after extraction
+    subprocess.run(
+        ["sudo", "chown", "-R", "www-data:www-data", str(site_dir)], check=True
+    )
 
     # Clean up
     wp_zip.unlink(missing_ok=True)
