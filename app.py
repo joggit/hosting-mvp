@@ -5,6 +5,7 @@ Hosting Manager MVP - Scalable Structure with WordPress Support
 import sys
 import logging
 import os
+import subprocess
 from pathlib import Path
 
 # Add project root to path
@@ -72,6 +73,20 @@ def show_routes():
 
     logger.info("\n" + "=" * 60)
 
+
+# Add this near the top of app.py (after imports)
+def nginx_command():
+    """Get nginx command with correct path"""
+    nginx_paths = ["/usr/sbin/nginx", "/usr/bin/nginx"]
+    for path in nginx_paths:
+        if os.path.exists(path):
+            return path
+    return "nginx"  # fallback
+
+
+# Then use it like:
+nginx_cmd = nginx_command()
+subprocess.run([nginx_cmd, "-t"], ...)
 
 # ═══════════════════════════════════════════════════════════
 # Startup Checks
