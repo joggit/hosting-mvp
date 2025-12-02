@@ -985,6 +985,8 @@ def ensure_permissions():
     Ensure 'deploy' user has proper permissions for WordPress deployment
     """
     import grp
+    import pwd
+    import subprocess
 
     DEPLOY_USER = "deploy"
     WWW_DIR = Path("/var/www/wordpress")
@@ -992,24 +994,107 @@ def ensure_permissions():
     logger.info("🔍 Checking deployment permissions...")
 
     try:
-        # Ensure www-data group exists and deploy is member
-        www_data_groups = grp.getgrnam("www-data")
-        if DEPLOY_USER not in www_data_groups.gr_mem:
-            logger.warning(f"⚠️ User '{DEPLOY_USER}' not in 'www-data' group.")
-            logger.info(f"   Run: sudo usermod -aG www-data {DEPLOY_USER}")
+        # Check if deploy user exists
+        try:
+            pwd.getpwnam(DEPLOY_USER)
+        except KeyError:
+            logger.error(f"❌ User '{DEPLOY_USER}' does not exist")
             return False
 
-        # Ensure WordPress directory exists and has correct permissions
+        # Check if www-data group exists
+        try:
+            www_data_groups = grp.getgrnam("www-data")
+        except KeyError:
+            logger.error("❌ Group 'www-data' does not exist")
+            return False
+
+        # Check if deploy is in www-data group
+        if DEPLOY_USER not in www_data_groups.gr_mem:
+            logger.warning(f"⚠️ User '{DEPLOY_USER}' not in 'www-data' group.")
+            logger.info(f"   Attempting to add '{DEPLOY_USER}' to 'www-data' group...")
+
+            # Try to add deploy to www-data group
+            try:
+                subprocess.run(
+                    ["sudo", "usermod", "-aG", "www-data", DEPLOY_USER], check=True
+                )
+                logger.info(f"✅ Added '{DEPLOY_USER}' to 'www-data' group")
+
+                # Refresh group membership
+                os.setgid(www_data_groups.gr_gid)
+            except Exception as e:
+                logger.error(f"❌ Failed to add user to group: {e}")
+                logger.info(
+                    f"   Please run manually: sudo usermod -aG www-data {DEPLOY_USER}"
+                )
+                return False
+
+        # Ensure WordPress directory exists
         WWW_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Set ownership to www-data
-        subprocess.run(
-            ["sudo", "chown", "-R", "www-data:www-data", str(WWW_DIR)], check=True
-        )
-        subprocess.run(["sudo", "chmod", "-R", "755", str(WWW_DIR)], check=True)
+        # Set proper ownership and permissions
+        try:
+            # Set ownership to www-data:www-data (but deploy can write via group)
+            subprocess.run(
+                ["sudo", "chown", "-R", "www-data:www-data", str(WWW_DIR)], check=True
+            )
 
-        logger.info("✅ Permissions OK for WordPress deployment")
-        return True
+            # Set directory permissions
+            subprocess.run(["sudo", "chmod", "-R", "2775", str(WWW_DIR)], check=True)
+
+            # Ensure all files are group-writable
+            subprocess.run(
+                [
+                    "sudo",
+                    "find",
+                    str(WWW_DIR),
+                    "-type",
+                    "f",
+                    "-exec",
+                    "chmod",
+                    "664",
+                    "{}",
+                    "+",
+                ],
+                check=False,
+            )
+
+            # Ensure all directories are group-writable and have setgid
+            subprocess.run(
+                [
+                    "sudo",
+                    "find",
+                    str(WWW_DIR),
+                    "-type",
+                    "d",
+                    "-exec",
+                    "chmod",
+                    "2775",
+                    "{}",
+                    "+",
+                ],
+                check=False,
+            )
+
+            logger.info(f"✅ Permissions set for {WWW_DIR}")
+
+        except subprocess.CalledProcessError as e:
+            logger.error(f"❌ Failed to set permissions: {e}")
+            logger.info("   Ensure 'deploy' has passwordless sudo for chown/chmod")
+            return False
+
+        # Verify deploy can write to directory
+        test_file = WWW_DIR / ".permission_test"
+        try:
+            test_file.write_text("test")
+            test_file.unlink()
+            logger.info("✅ 'deploy' can write to WordPress directory")
+            return True
+        except PermissionError:
+            logger.error(f"❌ 'deploy' cannot write to {WWW_DIR}")
+            logger.info("   Current permissions:")
+            subprocess.run(["ls", "-la", str(WWW_DIR)], check=False)
+            return False
 
     except Exception as e:
         logger.error(f"❌ Permission check failed: {e}")
