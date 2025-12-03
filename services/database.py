@@ -102,7 +102,6 @@ def init_database():
             executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (site_id) REFERENCES wordpress_sites(id) ON DELETE CASCADE
         );
-        # WordPress Sites table
 
         CREATE TABLE IF NOT EXISTS wordpress_sites (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -131,6 +130,7 @@ def init_database():
         CREATE INDEX IF NOT EXISTS idx_wp_plugins_site ON wordpress_plugins(site_id);
         CREATE INDEX IF NOT EXISTS idx_wp_themes_site ON wordpress_themes(site_id);
         CREATE INDEX IF NOT EXISTS idx_wp_cli_history_site ON wordpress_cli_history(site_id);
+        
     """
     )
 
