@@ -152,13 +152,15 @@ def run_command(cmd, shell=False, check=True, **kwargs):
 
 
 def run_mysql_query(query, database=None):
-    """Run MySQL query as root"""
-    password = get_mysql_root_password()
+    """
+    Run MySQL query - IMPROVED VERSION with better authentication
+    """
+    username, password = get_mysql_root_password()
 
     cmd = [
         "mysql",
         "-u",
-        MYSQL_ROOT_USER,
+        username,
         f"-p{password}",
         "-h",
         MYSQL_HOST,
@@ -167,7 +169,29 @@ def run_mysql_query(query, database=None):
         cmd.extend(["-D", database])
     cmd.extend(["-e", query])
 
-    return run_command(cmd, check=True)
+    try:
+        return run_command(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        # Enhanced error message
+        logger.error(f"MySQL query failed: {e.stderr}")
+        logger.error(f"Command: {' '.join(cmd[:3])} ... (password hidden)")
+        logger.error(f"Query: {query[:100]}...")  # Show first 100 chars of query
+
+        # Check if it's an auth error
+        if "Access denied" in e.stderr:
+            logger.error(
+                "\n❌ MySQL Authentication Failed!\n"
+                "This usually means:\n"
+                "  1. Password is incorrect\n"
+                "  2. MySQL user doesn't exist\n"
+                "  3. MySQL is using auth_socket instead of password\n"
+                "\nTo fix:\n"
+                "  sudo mysql -u root\n"
+                "  > ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY 'your_password';\n"
+                "  > FLUSH PRIVILEGES;\n"
+            )
+
+        raise
 
 
 # ============================================================================

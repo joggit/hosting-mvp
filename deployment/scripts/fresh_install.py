@@ -188,41 +188,33 @@ echo "PM2: $(pm2 --version)"
 echo "✅ Node.js + PM2 installed"
 
 # ═══════════════════════════════════════════════════════════
-# STEP 7: Install MySQL Server (FIXED - Reliable Auth)
+# STEP 7: Install MySQL Server (FIXED - Handle Existing)
 # ═══════════════════════════════════════════════════════════
-echo "[7/12] Installing MySQL server with proper authentication..."
+echo "[7/12] Installing MySQL server..."
 
-# Install MySQL
 DEBIAN_FRONTEND=noninteractive apt-get install -y mysql-server
 
-# Fix socket directory BEFORE starting MySQL
 mkdir -p /var/run/mysqld
 chown -R mysql:mysql /var/run/mysqld
 chmod -R 755 /var/run/mysqld
 
-# Start MySQL
 systemctl start mysql
 systemctl enable mysql
 sleep 5
 
-# Generate secure password
 MYSQL_ROOT_PASS=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-25)
 
-# Create hosting group for MySQL access
 groupadd -f hosting
 usermod -aG hosting {self.username}
 
-# CRITICAL FIX: Force MySQL to use password authentication
-# This works even if MySQL is using auth_socket initially
-sudo mysql -u root <<MYSQL_SETUP
--- Drop root@localhost if it exists (it uses auth_socket by default)
-DROP USER IF EXISTS 'root'@'localhost';
+echo "Configuring MySQL authentication..."
 
--- Recreate root with password authentication
+sudo mysql <<'MYSQL_SETUP' || echo "Using socket auth fallback..."
+ALTER USER IF EXISTS 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASS';
+DROP USER IF EXISTS 'root'@'localhost';
 CREATE USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASS';
 GRANT ALL PRIVILEGES ON *.* TO 'root'@'localhost' WITH GRANT OPTION;
 
--- Create dedicated hosting manager user (alternative to root)
 DROP USER IF EXISTS 'hosting_manager'@'localhost';
 CREATE USER 'hosting_manager'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASS';
 GRANT ALL PRIVILEGES ON *.* TO 'hosting_manager'@'localhost' WITH GRANT OPTION;
@@ -230,24 +222,25 @@ GRANT ALL PRIVILEGES ON *.* TO 'hosting_manager'@'localhost' WITH GRANT OPTION;
 FLUSH PRIVILEGES;
 MYSQL_SETUP
 
-# Save passwords with proper permissions
 mkdir -p /etc/hosting-manager
 echo "$MYSQL_ROOT_PASS" > /etc/hosting-manager/mysql_root_password
 chown root:hosting /etc/hosting-manager/mysql_root_password
 chmod 640 /etc/hosting-manager/mysql_root_password
 
-# Also save in root's home for emergency access
 echo "$MYSQL_ROOT_PASS" > /root/.mysql_root_password
 chmod 600 /root/.mysql_root_password
 
-# Test the connection
 if mysql -u root -p"$MYSQL_ROOT_PASS" -e "SELECT 1;" >/dev/null 2>&1; then
-    echo "✅ MySQL installed and password authentication verified"
-    echo "   Password saved to /etc/hosting-manager/mysql_root_password"
+    echo "✅ MySQL authentication verified"
 else
-    echo "❌ ERROR: MySQL password authentication test failed!"
+    echo "❌ MySQL auth test failed - manual fix needed"
+    echo "  sudo mysql"
+    echo "  > ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASS';"
     exit 1
 fi
+
+echo "✅ MySQL configured"
+
 # ═══════════════════════════════════════════════════════════
 # STEP 8: Install PHP and PHP-FPM
 # ═══════════════════════════════════════════════════════════
