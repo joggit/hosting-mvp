@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """
 Hosting Manager - Fresh Server Installation (Docker-Free)
-Pure server blocks + PM2 for Next.js, PHP-FPM for WordPress
-FIXED: MySQL auth for Ubuntu 24.04
-FIXED: WordPress deployment permissions
-FIXED: MySQL socket directory error
-FIXED: Unicode syntax error
+SIMPLIFIED VERSION - Assumes fresh/clean server
 """
 
 import argparse
@@ -90,9 +86,8 @@ class FreshInstaller:
 set -e
 
 echo "============================================"
-echo "Hosting Manager - Docker-Free Installation"
-echo "Next.js: Nginx + PM2"
-echo "WordPress: Nginx + PHP-FPM + MySQL"
+echo "Hosting Manager - SIMPLIFIED Installation"
+echo "Fresh MySQL + Nginx + PHP-FPM"
 echo "============================================"
 
 # ═══════════════════════════════════════════════════════════
@@ -188,58 +183,100 @@ echo "PM2: $(pm2 --version)"
 echo "✅ Node.js + PM2 installed"
 
 # ═══════════════════════════════════════════════════════════
-# STEP 7: Install MySQL Server (FIXED - Handle Existing)
+# STEP 7: Install MySQL Server (SIMPLIFIED - Fresh Install)
 # ═══════════════════════════════════════════════════════════
-echo "[7/12] Installing MySQL server..."
+echo "[7/12] Installing MySQL server (fresh install)..."
 
+# Remove any existing MySQL completely
+systemctl stop mysql 2>/dev/null || true
+apt-get remove --purge mysql-server mysql-client mysql-common -y 2>/dev/null || true
+rm -rf /etc/mysql /var/lib/mysql /var/log/mysql
+rm -rf /etc/hosting-manager/mysql_root_password /root/.mysql_root_password
+rm -rf /root/.my.cnf /root/.mysql
+rm -rf /home/{self.username}/.my.cnf /home/{self.username}/.mysql
+
+# Install fresh MySQL
 DEBIAN_FRONTEND=noninteractive apt-get install -y mysql-server
 
+# Create socket directory
 mkdir -p /var/run/mysqld
 chown -R mysql:mysql /var/run/mysqld
 chmod -R 755 /var/run/mysqld
 
+# Start MySQL
 systemctl start mysql
 systemctl enable mysql
 sleep 5
 
+# Generate password
 MYSQL_ROOT_PASS=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-25)
 
+# Create hosting group
 groupadd -f hosting
 usermod -aG hosting {self.username}
 
-echo "Configuring MySQL authentication..."
+# Set root password using init file (bulletproof method)
+echo "Setting MySQL root password..."
 
-sudo mysql <<'MYSQL_SETUP' || echo "Using socket auth fallback..."
-ALTER USER IF EXISTS 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASS';
-DROP USER IF EXISTS 'root'@'localhost';
-CREATE USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASS';
-GRANT ALL PRIVILEGES ON *.* TO 'root'@'localhost' WITH GRANT OPTION;
+# Stop MySQL
+systemctl stop mysql
 
-DROP USER IF EXISTS 'hosting_manager'@'localhost';
-CREATE USER 'hosting_manager'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASS';
-GRANT ALL PRIVILEGES ON *.* TO 'hosting_manager'@'localhost' WITH GRANT OPTION;
+# Create init file
+echo "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASS';" > /tmp/mysql-init.sql
+echo "FLUSH PRIVILEGES;" >> /tmp/mysql-init.sql
 
-FLUSH PRIVILEGES;
-MYSQL_SETUP
+# Start MySQL with init file
+mysqld --user=mysql --init-file=/tmp/mysql-init.sql &
+MYSQLD_PID=$!
 
-mkdir -p /etc/hosting-manager
-echo "$MYSQL_ROOT_PASS" > /etc/hosting-manager/mysql_root_password
-chown root:hosting /etc/hosting-manager/mysql_root_password
-chmod 640 /etc/hosting-manager/mysql_root_password
+# Wait for it to process
+sleep 8
 
-echo "$MYSQL_ROOT_PASS" > /root/.mysql_root_password
-chmod 600 /root/.mysql_root_password
+# Stop the temporary process
+kill $MYSQLD_PID 2>/dev/null || true
+pkill -f "mysqld.*init-file" 2>/dev/null || true
+sleep 2
 
-if mysql -u root -p"$MYSQL_ROOT_PASS" -e "SELECT 1;" >/dev/null 2>&1; then
-    echo "✅ MySQL authentication verified"
-else
-    echo "❌ MySQL auth test failed - manual fix needed"
-    echo "  sudo mysql"
-    echo "  > ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASS';"
+# Clean up
+rm -f /tmp/mysql-init.sql
+
+# Start MySQL normally
+systemctl start mysql
+sleep 3
+
+# Verify password works
+if ! mysql -u root -p"$MYSQL_ROOT_PASS" -e "SELECT 1;" >/dev/null 2>&1; then
+    echo "❌ Failed to set MySQL password"
     exit 1
 fi
 
-echo "✅ MySQL configured"
+echo "✅ MySQL password set successfully"
+
+# Create users
+echo "Creating MySQL users..."
+mysql -u root -p"$MYSQL_ROOT_PASS" -e "CREATE USER 'hosting_manager'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASS';"
+mysql -u root -p"$MYSQL_ROOT_PASS" -e "GRANT ALL PRIVILEGES ON *.* TO 'hosting_manager'@'localhost' WITH GRANT OPTION;"
+
+mysql -u root -p"$MYSQL_ROOT_PASS" -e "CREATE USER 'wp_manager'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASS';"
+mysql -u root -p"$MYSQL_ROOT_PASS" -e "GRANT CREATE, DROP, SELECT, INSERT, UPDATE, DELETE, ALTER, INDEX, CREATE TEMPORARY TABLES, LOCK TABLES ON *.* TO 'wp_manager'@'localhost';"
+
+mysql -u root -p"$MYSQL_ROOT_PASS" -e "FLUSH PRIVILEGES;"
+
+# Save password
+mkdir -p /etc/hosting-manager
+echo "$MYSQL_ROOT_PASS" > /etc/hosting-manager/mysql_root_password
+echo "$MYSQL_ROOT_PASS" > /root/.mysql_root_password
+chown root:hosting /etc/hosting-manager/mysql_root_password
+chmod 640 /etc/hosting-manager/mysql_root_password
+chmod 600 /root/.mysql_root_password
+
+# Test
+if mysql -u root -p"$MYSQL_ROOT_PASS" -e "SELECT 1;" >/dev/null 2>&1; then
+    echo "✅ MySQL installed and configured"
+else
+    echo "❌ MySQL test failed"
+    exit 1
+fi
 
 # ═══════════════════════════════════════════════════════════
 # STEP 8: Install PHP and PHP-FPM
@@ -280,57 +317,47 @@ pip3 install --break-system-packages Flask==3.0.0 Flask-CORS==4.0.0 PyMySQL==1.1
 echo "✅ Python + Nginx installed"
 
 # ═══════════════════════════════════════════════════════════
-# STEP 11: Setup Directory Structure with PROPER PERMISSIONS
+# STEP 11: Setup Directory Structure
 # ═══════════════════════════════════════════════════════════
-echo "[11/12] Creating directory structure with proper permissions..."
+echo "[11/12] Creating directory structure..."
 
 mkdir -p /var/lib/hosting-manager
 mkdir -p /var/log/hosting-manager
 mkdir -p /var/www/domains
 mkdir -p /var/www/wordpress
 
-# Set ownership - deploy owns hosting-manager, www-data owns wordpress
 chown -R {self.username}:{self.username} /var/lib/hosting-manager
 chown -R {self.username}:{self.username} /var/log/hosting-manager
 chown -R {self.username}:{self.username} /var/www/domains
 chown -R www-data:www-data /var/www/wordpress
 
-# Add deploy to www-data group for WordPress deployment
 usermod -aG www-data {self.username}
 
-# Set proper permissions for WordPress directory
-chmod -R 2775 /var/www/wordpress  # setgid bit for group inheritance
+chmod -R 2775 /var/www/wordpress
 
-# FIX: Nginx PID directory permissions to avoid "nginx.pid" errors
 mkdir -p /run/nginx
 chown -R www-data:www-data /run/nginx
 chmod -R 755 /run/nginx
 
-# FIX: Remove problematic "user" directive from nginx.conf to avoid warnings
 sed -i '/^user /d' /etc/nginx/nginx.conf
 
 chmod -R 755 /var/www/domains
-
-# Fix Nginx directory permissions for deploy user access
 chmod 775 /etc/nginx/sites-available
 chmod 775 /etc/nginx/sites-enabled
-
-# Fix PHP-FPM pool directory permissions
 chmod 775 /etc/php/8.3/fpm/pool.d
 
-echo "✅ Directory structure created with proper permissions"
-echo "   - /var/www/domains (Next.js apps)"
-echo "   - /var/www/wordpress (WordPress sites)"
+echo "✅ Directory structure created"
 
-# Deploy Application
-echo ""
-echo "Deploying application..."
+# ═══════════════════════════════════════════════════════════
+# STEP 12: Deploy Application
+# ═══════════════════════════════════════════════════════════
+echo "[12/12] Deploying application..."
+
 mkdir -p /opt/hosting-manager
 chown {self.username}:{self.username} /opt/hosting-manager
 
 if [ -d "/opt/hosting-manager/.git" ]; then
     cd /opt/hosting-manager
-    # Force reset any local changes and pull fresh
     sudo -u {self.username} git fetch --all
     sudo -u {self.username} git reset --hard origin/main
     sudo -u {self.username} git clean -fd
@@ -343,15 +370,13 @@ pip3 install --break-system-packages -r requirements.txt 2>&1 | grep -v "WARNING
 
 # Create environment file
 MYSQL_ROOT_PASS=$(cat /root/.mysql_root_password)
-cat > /opt/hosting-manager/.env << ENV
-MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASS
-WORDPRESS_BASE_DIR=/var/www/wordpress
-ENV
+echo "MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASS" > /opt/hosting-manager/.env
+echo "WORDPRESS_BASE_DIR=/var/www/wordpress" >> /opt/hosting-manager/.env
 
 chown {self.username}:{self.username} /opt/hosting-manager/.env
 
 # Create systemd service
-cat > /etc/systemd/system/hosting-manager.service << 'SERVICE'
+cat > /etc/systemd/system/hosting-manager.service << 'SERVICEEOF'
 [Unit]
 Description=Hosting Manager API
 After=network.target mysql.service php8.3-fpm.service
@@ -370,7 +395,7 @@ RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
-SERVICE
+SERVICEEOF
 
 systemctl daemon-reload
 systemctl enable hosting-manager
@@ -382,7 +407,7 @@ echo "✅ Application deployed"
 # Configure Nginx
 rm -f /etc/nginx/sites-enabled/default
 
-cat > /etc/nginx/sites-available/hosting-manager-api << 'NGINX'
+cat > /etc/nginx/sites-available/hosting-manager-api << 'NGINXEOF'
 server {{
     listen 80 default_server;
     server_name _;
@@ -395,11 +420,11 @@ server {{
     }}
 
     location / {{
-        return 200 '<!DOCTYPE html><html><head><title>Hosting Manager</title></head><body><h1>Hosting Manager Active</h1><p>Next.js: Nginx + PM2</p><p>WordPress: Nginx + PHP-FPM + MySQL</p><p>No Docker - Pure Server Blocks</p></body></html>';
+        return 200 '<!DOCTYPE html><html><head><title>Hosting Manager</title></head><body><h1>Hosting Manager Active</h1></body></html>';
         add_header Content-Type text/html;
     }}
 }}
-NGINX
+NGINXEOF
 
 ln -sf /etc/nginx/sites-available/hosting-manager-api /etc/nginx/sites-enabled/
 nginx -t && systemctl reload nginx
@@ -409,40 +434,28 @@ echo "============================================"
 echo "✅ Installation Complete!"
 echo "============================================"
 echo ""
-echo "🚀 Architecture:"
-echo "   - Next.js: Nginx + PM2 (ports 3000-4000)"
-echo "   - WordPress: Nginx + PHP-FPM + MySQL"
-echo "   - No Docker - Pure server blocks"
-echo ""
-echo "📋 Key Fixes Applied:"
-echo "   - WordPress extraction permission issues fixed"
-echo "   - Proper sudo permissions for WordPress deployment"
-echo "   - Correct directory ownership (www-data for WordPress)"
-echo "   - Nginx and PHP-FPM directory permissions fixed"
-echo ""
-echo "Test SSH:"
+echo "Test:"
 echo "  ssh {self.username}@{self.server}"
-echo ""
-echo "Test API:"
 echo "  curl http://{self.server}:5000/api/health"
 echo ""
-echo "MySQL root password saved to:"
-echo "  /root/.mysql_root_password"
-echo ""
-echo "⚠️  IMPORTANT: Log out and log back in for group changes to take effect!"
+echo "⚠️  IMPORTANT: Log out and log back in!"
 echo ""
 """
 
     def install(self):
         """Run installation"""
-        print_header("🚀 Hosting Manager - Docker-Free Installation")
+        print_header("🚀 Hosting Manager - Simplified Installation")
         print(f"Server:     {self.server}")
         print(f"User:       {self.username}")
         print(f"Repository: {self.repo_url}")
-        print(f"\n🔑 SSH Key:")
-        print(f"   {self.ssh_public_key}\n")
+        print()
+        print_warning("This will REMOVE any existing MySQL installation!")
+        print()
 
-        input("Press Enter to continue...")
+        response = input("Continue? (yes/no): ")
+        if response.lower() != "yes":
+            print("Aborted.")
+            sys.exit(0)
 
         install_script = self.build_installation_script()
 
@@ -483,22 +496,6 @@ echo ""
             print()
             print_header("✅ Installation Successful!")
 
-            time.sleep(3)
-
-            test_result = subprocess.run(
-                f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 {self.username}@{self.server} 'whoami'",
-                shell=True,
-                capture_output=True,
-                text=True,
-            )
-
-            if test_result.returncode == 0:
-                print_success(f"✅ SSH works!")
-                print(f"\n   ssh {self.username}@{self.server}\n")
-                print(
-                    "⚠️  IMPORTANT: Log out and log back in for group changes to take effect!"
-                )
-
         except Exception as e:
             print_error(f"Installation failed: {e}")
             sys.exit(1)
@@ -506,11 +503,11 @@ echo ""
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fresh server installation - Docker-Free"
+        description="Fresh server installation - SIMPLIFIED (removes existing MySQL)"
     )
-    parser.add_argument("--server", required=True)
-    parser.add_argument("--user", required=True)
-    parser.add_argument("--repo", required=True)
+    parser.add_argument("--server", required=True, help="Server IP address")
+    parser.add_argument("--user", required=True, help="Username (e.g., deploy)")
+    parser.add_argument("--repo", required=True, help="Git repository URL")
     parser.add_argument("--root-password", help="Root password (optional)")
 
     args = parser.parse_args()

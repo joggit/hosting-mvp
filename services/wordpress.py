@@ -1,12 +1,8 @@
 """
-WordPress deployment and management service - TRADITIONAL APPROACH
-No Docker - uses shared MySQL, PHP-FPM pools, and nginx server blocks
-Clean, focused traditional hosting
+COMPLETE REPLACEMENT FOR services/wordpress.py MySQL SECTION
 
-✅ NO Docker dependencies
-✅ Uses secure MySQL password from /etc/hosting-manager/mysql_root_password
-✅ Traditional PHP-FPM pool management
-✅ Nginx server blocks (no reverse proxy for WordPress)
+Replace everything from the imports through run_mysql_query() function
+(approximately lines 1-115 in your current file)
 """
 
 import os
@@ -30,21 +26,15 @@ NGINX_SITES_ENABLED = Path("/etc/nginx/sites-enabled")
 PHP_FPM_POOL_DIR = Path("/etc/php/8.3/fpm/pool.d")
 MYSQL_HOST = "localhost"
 MYSQL_ROOT_USER = "root"
-# Configuration - ADD THIS
-MYSQL_HOSTING_USER = "hosting_manager"  # Alternative user with same privileges
+MYSQL_HOSTING_USER = "hosting_manager"  # NEW: Alternative user
 
 
 # ============================================================================
-# 🔒 SECURE MySQL Root Password Retrieval
+# 🔒 SECURE MySQL Root Password Retrieval - IMPROVED VERSION
 # ============================================================================
 def get_mysql_root_password():
     """
-    Get MySQL root password with multiple fallback strategies.
-
-    Order of preference:
-      1. Environment variable (MYSQL_ROOT_PASSWORD in .env)
-      2. /etc/hosting-manager/mysql_root_password (chmod 640, root:hosting)
-      3. /root/.mysql_root_password (emergency fallback)
+    Get MySQL credentials with multiple fallback strategies.
 
     Returns:
         tuple: (username, password) to use for MySQL connection
@@ -55,72 +45,57 @@ def get_mysql_root_password():
     # Strategy 1: Environment variable
     password = os.getenv("MYSQL_ROOT_PASSWORD")
     if password:
-        logger.debug("MySQL password loaded from environment")
+        logger.debug("MySQL password from environment")
         return (username, password.strip())
 
-    # Strategy 2: Shared hosting-manager location (primary method)
+    # Strategy 2: Primary location
     secure_path = Path("/etc/hosting-manager/mysql_root_password")
     if secure_path.exists():
         try:
             password = secure_path.read_text().strip()
-            logger.debug(f"MySQL password loaded from {secure_path}")
+            logger.debug(f"MySQL password from {secure_path}")
             return (username, password)
         except PermissionError:
-            logger.warning(
-                f"⚠️ Permission denied reading {secure_path}\n"
-                f"   Current user: {os.getenv('USER')}\n"
-                f"   Fix: sudo usermod -aG hosting {os.getenv('USER')}\n"
-                f"   Then log out and log back in"
-            )
-            # Don't raise yet, try other methods
+            logger.warning(f"⚠️ Permission denied reading {secure_path}")
         except Exception as e:
             logger.warning(f"Failed to read {secure_path}: {e}")
 
-    # Strategy 3: Emergency root fallback
+    # Strategy 3: Root home fallback
     root_path = Path("/root/.mysql_root_password")
     if root_path.exists():
         try:
             password = root_path.read_text().strip()
-            logger.debug(f"MySQL password loaded from {root_path} (fallback)")
+            logger.debug(f"MySQL password from {root_path}")
             return (username, password)
-        except PermissionError:
-            logger.warning(f"⚠️ Permission denied reading {root_path}")
         except Exception as e:
-            logger.warning(f"Failed to read {root_path}: {e}")
+            logger.debug(f"Could not read {root_path}: {e}")
 
-    # Strategy 4: Try alternative hosting_manager user
-    if secure_path.exists():
-        try:
-            password = secure_path.read_text().strip()
-            logger.info(f"Attempting connection with '{MYSQL_HOSTING_USER}' user")
-            return (MYSQL_HOSTING_USER, password)
-        except:
-            pass
+    # Strategy 4: Try alternative user with found password
+    if password and secure_path.exists():
+        logger.info(f"Attempting connection with '{MYSQL_HOSTING_USER}' user")
+        return (MYSQL_HOSTING_USER, password)
 
-    # Final error with detailed instructions
-    current_user = os.getenv("USER") or os.getenv("LOGNAME") or "unknown"
-    groups_output = os.popen(f"groups {current_user} 2>/dev/null").read().strip()
+    # Final error with diagnostics
+    current_user = os.getenv("USER", "unknown")
+    try:
+        groups_output = subprocess.run(
+            ["groups", current_user], capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+    except:
+        groups_output = "unknown"
 
     error_msg = f"""
-MySQL root password not found. Ensure one of:
-  
-  1. MYSQL_ROOT_PASSWORD in .env file
-  2. /etc/hosting-manager/mysql_root_password (chmod 640, root:hosting)
-  3. /root/.mysql_root_password (chmod 600)
+MySQL password not found.
 
 Current user: {current_user}
-Current groups: {groups_output}
+Groups: {groups_output}
 
-To fix permissions:
-  sudo usermod -aG hosting {current_user}
-  sudo chmod 640 /etc/hosting-manager/mysql_root_password
-  sudo chown root:hosting /etc/hosting-manager/mysql_root_password
-  
-Then LOG OUT and LOG BACK IN for group changes to take effect!
-
-To verify:
-  groups {current_user}  # Should show 'hosting' group
-  cat /etc/hosting-manager/mysql_root_password  # Should not give permission error
+Fix:
+  1. sudo chown root:hosting /etc/hosting-manager/mysql_root_password
+  2. sudo chmod 640 /etc/hosting-manager/mysql_root_password
+  3. sudo usermod -aG hosting {current_user}
+  4. Log out and log back in
+  5. Verify: cat /etc/hosting-manager/mysql_root_password
 """
 
     logger.error(error_msg)
@@ -130,8 +105,6 @@ To verify:
 # ============================================================================
 # Helper Functions
 # ============================================================================
-
-
 def generate_password(length=32):
     """Generate secure alphanumeric password"""
     alphabet = string.ascii_letters + string.digits
@@ -153,8 +126,12 @@ def run_command(cmd, shell=False, check=True, **kwargs):
 
 def run_mysql_query(query, database=None):
     """
-    Run MySQL query - IMPROVED VERSION with better authentication
+    Run MySQL query - IMPROVED VERSION
+
+    Returns:
+        subprocess.CompletedProcess result
     """
+    # Get credentials (now returns tuple)
     username, password = get_mysql_root_password()
 
     cmd = [
@@ -165,34 +142,59 @@ def run_mysql_query(query, database=None):
         "-h",
         MYSQL_HOST,
     ]
+
     if database:
         cmd.extend(["-D", database])
+
     cmd.extend(["-e", query])
 
     try:
-        return run_command(cmd, check=True)
-    except subprocess.CalledProcessError as e:
-        # Enhanced error message
-        logger.error(f"MySQL query failed: {e.stderr}")
-        logger.error(f"Command: {' '.join(cmd[:3])} ... (password hidden)")
-        logger.error(f"Query: {query[:100]}...")  # Show first 100 chars of query
+        result = run_command(cmd, check=True)
+        return result
 
-        # Check if it's an auth error
+    except subprocess.CalledProcessError as e:
+        # Enhanced error logging
+        cmd_safe = " ".join(cmd[:3]) + " -p*** ..."
+        logger.error(f"MySQL query failed")
+        logger.error(f"Command: {cmd_safe}")
+        logger.error(f"Query: {query[:200]}...")
+        logger.error(f"Error: {e.stderr}")
+
+        # Provide helpful error messages
         if "Access denied" in e.stderr:
             logger.error(
-                "\n❌ MySQL Authentication Failed!\n"
-                "This usually means:\n"
-                "  1. Password is incorrect\n"
-                "  2. MySQL user doesn't exist\n"
-                "  3. MySQL is using auth_socket instead of password\n"
-                "\nTo fix:\n"
-                "  sudo mysql -u root\n"
-                "  > ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY 'your_password';\n"
+                "\n❌ MySQL Authentication Failed\n"
+                "Common causes:\n"
+                "  1. Wrong password in /etc/hosting-manager/mysql_root_password\n"
+                "  2. User doesn't exist\n"
+                "  3. MySQL using auth_socket instead of password\n"
+                "\n"
+                "To fix:\n"
+                "  sudo mysql\n"
+                "  > ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY 'password';\n"
                 "  > FLUSH PRIVILEGES;\n"
+                "  > exit\n"
+                "  Then update /etc/hosting-manager/mysql_root_password with the correct password\n"
+            )
+        elif "Can't connect" in e.stderr:
+            logger.error(
+                "\n❌ Cannot Connect to MySQL\n"
+                "Check:\n"
+                "  1. MySQL is running: sudo systemctl status mysql\n"
+                "  2. Socket exists: ls -la /var/run/mysqld/mysqld.sock\n"
+            )
+        elif "doesn't exist" in e.stderr:
+            logger.error(
+                f"\n❌ Database or table doesn't exist in query: {query[:100]}\n"
             )
 
         raise
 
+
+# ============================================================================
+# Continue with rest of wordpress.py below this line
+# (MySQL Database Management, PHP-FPM Pool Management, etc.)
+# ============================================================================
 
 # ============================================================================
 # MySQL Database Management
