@@ -30,6 +30,8 @@ NGINX_SITES_ENABLED = Path("/etc/nginx/sites-enabled")
 PHP_FPM_POOL_DIR = Path("/etc/php/8.3/fpm/pool.d")
 MYSQL_HOST = "localhost"
 MYSQL_ROOT_USER = "root"
+# Configuration - ADD THIS
+MYSQL_HOSTING_USER = "hosting_manager"  # Alternative user with same privileges
 
 
 # ============================================================================
@@ -37,37 +39,92 @@ MYSQL_ROOT_USER = "root"
 # ============================================================================
 def get_mysql_root_password():
     """
-    Get MySQL root password — safe for 'deploy' user.
+    Get MySQL root password with multiple fallback strategies.
+
     Order of preference:
-      1. Environment variable (e.g., MYSQL_ROOT_PASSWORD in .env)
+      1. Environment variable (MYSQL_ROOT_PASSWORD in .env)
       2. /etc/hosting-manager/mysql_root_password (chmod 640, root:hosting)
+      3. /root/.mysql_root_password (emergency fallback)
+
+    Returns:
+        tuple: (username, password) to use for MySQL connection
     """
-    # 1. Environment (e.g., .env)
+    password = None
+    username = "root"
+
+    # Strategy 1: Environment variable
     password = os.getenv("MYSQL_ROOT_PASSWORD")
     if password:
-        logger.debug("MySQL root password loaded from environment")
-        return password.strip()
+        logger.debug("MySQL password loaded from environment")
+        return (username, password.strip())
 
-    # 2. Secure shared location
+    # Strategy 2: Shared hosting-manager location (primary method)
     secure_path = Path("/etc/hosting-manager/mysql_root_password")
     if secure_path.exists():
         try:
-            return secure_path.read_text().strip()
+            password = secure_path.read_text().strip()
+            logger.debug(f"MySQL password loaded from {secure_path}")
+            return (username, password)
         except PermissionError:
             logger.warning(
-                f"⚠️ Permission denied reading {secure_path} — ensure 'deploy' is in 'hosting' group"
+                f"⚠️ Permission denied reading {secure_path}\n"
+                f"   Current user: {os.getenv('USER')}\n"
+                f"   Fix: sudo usermod -aG hosting {os.getenv('USER')}\n"
+                f"   Then log out and log back in"
             )
-            raise
+            # Don't raise yet, try other methods
         except Exception as e:
-            logger.error(f"Failed to read {secure_path}: {e}")
+            logger.warning(f"Failed to read {secure_path}: {e}")
 
-    # Final error
-    raise FileNotFoundError(
-        "MySQL root password not found. Ensure one of:\n"
-        "  - MYSQL_ROOT_PASSWORD in .env\n"
-        "  - /etc/hosting-manager/mysql_root_password (chmod 640, root:hosting)\n"
-        "  - 'deploy' user added to 'hosting' group"
-    )
+    # Strategy 3: Emergency root fallback
+    root_path = Path("/root/.mysql_root_password")
+    if root_path.exists():
+        try:
+            password = root_path.read_text().strip()
+            logger.debug(f"MySQL password loaded from {root_path} (fallback)")
+            return (username, password)
+        except PermissionError:
+            logger.warning(f"⚠️ Permission denied reading {root_path}")
+        except Exception as e:
+            logger.warning(f"Failed to read {root_path}: {e}")
+
+    # Strategy 4: Try alternative hosting_manager user
+    if secure_path.exists():
+        try:
+            password = secure_path.read_text().strip()
+            logger.info(f"Attempting connection with '{MYSQL_HOSTING_USER}' user")
+            return (MYSQL_HOSTING_USER, password)
+        except:
+            pass
+
+    # Final error with detailed instructions
+    current_user = os.getenv("USER") or os.getenv("LOGNAME") or "unknown"
+    groups_output = os.popen(f"groups {current_user} 2>/dev/null").read().strip()
+
+    error_msg = f"""
+MySQL root password not found. Ensure one of:
+  
+  1. MYSQL_ROOT_PASSWORD in .env file
+  2. /etc/hosting-manager/mysql_root_password (chmod 640, root:hosting)
+  3. /root/.mysql_root_password (chmod 600)
+
+Current user: {current_user}
+Current groups: {groups_output}
+
+To fix permissions:
+  sudo usermod -aG hosting {current_user}
+  sudo chmod 640 /etc/hosting-manager/mysql_root_password
+  sudo chown root:hosting /etc/hosting-manager/mysql_root_password
+  
+Then LOG OUT and LOG BACK IN for group changes to take effect!
+
+To verify:
+  groups {current_user}  # Should show 'hosting' group
+  cat /etc/hosting-manager/mysql_root_password  # Should not give permission error
+"""
+
+    logger.error(error_msg)
+    raise FileNotFoundError(error_msg)
 
 
 # ============================================================================

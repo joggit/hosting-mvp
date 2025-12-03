@@ -4,6 +4,8 @@ Hosting Manager - Fresh Server Installation (Docker-Free)
 Pure server blocks + PM2 for Next.js, PHP-FPM for WordPress
 FIXED: MySQL auth for Ubuntu 24.04
 FIXED: WordPress deployment permissions
+FIXED: MySQL socket directory error
+FIXED: Unicode syntax error
 """
 
 import argparse
@@ -186,111 +188,66 @@ echo "PM2: $(pm2 --version)"
 echo "✅ Node.js + PM2 installed"
 
 # ═══════════════════════════════════════════════════════════
-# STEP 7: Install & Secure MySQL Server (Robust for Ubuntu 24.04)
+# STEP 7: Install MySQL Server (FIXED - Reliable Auth)
 # ═══════════════════════════════════════════════════════════
-echo "[7/12] Installing & securing MySQL server..."
+echo "[7/12] Installing MySQL server with proper authentication..."
 
-# Install MySQL if not present
-if ! dpkg -l | grep -q "mysql-server"; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y mysql-server
-fi
+# Install MySQL
+DEBIAN_FRONTEND=noninteractive apt-get install -y mysql-server
 
+# Fix socket directory BEFORE starting MySQL
+mkdir -p /var/run/mysqld
+chown -R mysql:mysql /var/run/mysqld
+chmod -R 755 /var/run/mysqld
+
+# Start MySQL
 systemctl start mysql
 systemctl enable mysql
+sleep 5
 
-# Generate a strong password (only once)
-MYSQL_ROOT_PASS=""
-MYSQL_PASS_FILE="/root/.mysql_root_password"
-SECURE_PASS_FILE="/etc/hosting-manager/mysql_root_password"
+# Generate secure password
+MYSQL_ROOT_PASS=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-25)
 
-# Try to get existing password first
-if [ -f "$MYSQL_PASS_FILE" ]; then
-    MYSQL_ROOT_PASS=$(cat "$MYSQL_PASS_FILE")
-    echo "✅ Using existing MySQL root password from $MYSQL_PASS_FILE"
-elif [ -f "/root/.my.cnf" ]; then
-    # Extract from .my.cnf
-    MYSQL_ROOT_PASS=$(grep '^password=' /root/.my.cnf 2>/dev/null | cut -d= -f2)
-    if [ -n "$MYSQL_ROOT_PASS" ]; then
-        echo "✅ Extracted MySQL password from /root/.my.cnf"
-    fi
-fi
+# Create hosting group for MySQL access
+groupadd -f hosting
+usermod -aG hosting {self.username}
 
-# If still no password, probe MySQL access method
-if [ -z "$MYSQL_ROOT_PASS" ]; then
-    if mysql -e "SELECT 1;" 2>/dev/null; then
-        # MySQL allows passwordless root (auth_socket), so set one
-        MYSQL_ROOT_PASS="SecureRootPass$(openssl rand -base64 12 | tr -dc 'A-Za-z0-9' | head -c 16)"
-        echo "🔧 Setting new MySQL root password (was using auth_socket)..."
-        mysql << MYSQL_SETUP
-ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASS';
+# CRITICAL FIX: Force MySQL to use password authentication
+# This works even if MySQL is using auth_socket initially
+sudo mysql -u root <<MYSQL_SETUP
+-- Drop root@localhost if it exists (it uses auth_socket by default)
+DROP USER IF EXISTS 'root'@'localhost';
+
+-- Recreate root with password authentication
+CREATE USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASS';
+GRANT ALL PRIVILEGES ON *.* TO 'root'@'localhost' WITH GRANT OPTION;
+
+-- Create dedicated hosting manager user (alternative to root)
+DROP USER IF EXISTS 'hosting_manager'@'localhost';
+CREATE USER 'hosting_manager'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASS';
+GRANT ALL PRIVILEGES ON *.* TO 'hosting_manager'@'localhost' WITH GRANT OPTION;
+
 FLUSH PRIVILEGES;
 MYSQL_SETUP
-        echo "✅ MySQL root password set."
-    else
-        # Truly fresh — generate and apply
-        MYSQL_ROOT_PASS="SecureRootPass$(openssl rand -base64 12 | tr -dc 'A-Za-z0-9' | head -c 16)"
-        echo "🔧 Configuring fresh MySQL root password..."
-        # Try common paths for mysqld_safe or system init
-        if [ -x "/usr/bin/mysqld_safe" ]; then
-            systemctl stop mysql
-            mysqld_safe --skip-grant-tables &
-            sleep 5
-            mysql << RESET_PASS
-FLUSH PRIVILEGES;
-ALTER USER 'root'@'localhost' IDENTIFIED BY '$MYSQL_ROOT_PASS';
-FLUSH PRIVILEGES;
-exit
-RESET_PASS
-            pkill mysqld_safe
-            systemctl start mysql
-        else
-            # Fallback: reinstall config
-            sudo debconf-set-selections <<< "mysql-server mysql-server/root_password password $MYSQL_ROOT_PASS"
-            sudo debconf-set-selections <<< "mysql-server mysql-server/root_password_again password $MYSQL_ROOT_PASS"
-            DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall mysql-server
-        fi
-    fi
-fi
 
-# Ensure password is saved securely in both locations
+# Save passwords with proper permissions
 mkdir -p /etc/hosting-manager
-echo "$MYSQL_ROOT_PASS" > "$MYSQL_PASS_FILE"
-echo "$MYSQL_ROOT_PASS" > "$SECURE_PASS_FILE"
+echo "$MYSQL_ROOT_PASS" > /etc/hosting-manager/mysql_root_password
+chown root:hosting /etc/hosting-manager/mysql_root_password
+chmod 640 /etc/hosting-manager/mysql_root_password
 
-chmod 600 "$MYSQL_PASS_FILE"
-chmod 640 "$SECURE_PASS_FILE"
+# Also save in root's home for emergency access
+echo "$MYSQL_ROOT_PASS" > /root/.mysql_root_password
+chmod 600 /root/.mysql_root_password
 
-# Ensure 'hosting' group exists and owns the secure file
-groupadd hosting 2>/dev/null || true
-chown root:hosting "$SECURE_PASS_FILE"
-
-# Optional: Add 'deploy' to hosting group if user exists
-if id "deploy" &>/dev/null; then
-    usermod -aG hosting deploy
+# Test the connection
+if mysql -u root -p"$MYSQL_ROOT_PASS" -e "SELECT 1;" >/dev/null 2>&1; then
+    echo "✅ MySQL installed and password authentication verified"
+    echo "   Password saved to /etc/hosting-manager/mysql_root_password"
+else
+    echo "❌ ERROR: MySQL password authentication test failed!"
+    exit 1
 fi
-
-# Create .my.cnf for root convenience
-cat > /root/.my.cnf << MYCNF
-[client]
-user=root
-password=$MYSQL_ROOT_PASS
-host=localhost
-MYCNF
-chmod 600 /root/.my.cnf
-
-# Final security hardening
-mysql << MYSQL_HARDEN
-DELETE FROM mysql.user WHERE User='';
-DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
-DROP DATABASE IF EXISTS test;
-DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
-FLUSH PRIVILEGES;
-MYSQL_HARDEN
-
-echo "✅ MySQL server secured"
-echo "   🔑 Root password saved to:"
-echo "      - /root/.mysql_root_password (600, root)"
-echo "      - /etc/hosting-manager/mysql_root_password (640, root:hosting)"
 # ═══════════════════════════════════════════════════════════
 # STEP 8: Install PHP and PHP-FPM
 # ═══════════════════════════════════════════════════════════
@@ -350,7 +307,15 @@ usermod -aG www-data {self.username}
 
 # Set proper permissions for WordPress directory
 chmod -R 2775 /var/www/wordpress  # setgid bit for group inheritance
-find /var/www/wordpress -type f -exec chmod 664 {{}} \\;
+
+# FIX: Nginx PID directory permissions to avoid "nginx.pid" errors
+mkdir -p /run/nginx
+chown -R www-data:www-data /run/nginx
+chmod -R 755 /run/nginx
+
+# FIX: Remove problematic "user" directive from nginx.conf to avoid warnings
+sed -i '/^user /d' /etc/nginx/nginx.conf
+
 chmod -R 755 /var/www/domains
 
 # Fix Nginx directory permissions for deploy user access
@@ -364,45 +329,6 @@ echo "✅ Directory structure created with proper permissions"
 echo "   - /var/www/domains (Next.js apps)"
 echo "   - /var/www/wordpress (WordPress sites)"
 
-# ═══════════════════════════════════════════════════════════
-# STEP 12: Configure WordPress Deployment Permissions
-# ═══════════════════════════════════════════════════════════
-echo "[12/12] Configuring WordPress deployment permissions..."
-
-# Create specific sudo permissions for WordPress deployment
-cat > /etc/sudoers.d/{self.username}-wordpress << 'SUDOERS_WP'
-Defaults:{self.username} !requiretty
-Defaults:{self.username} !authenticate
-
-# Allow Nginx configuration management
-{self.username} ALL=(root) NOPASSWD: /bin/cp /tmp/*.conf /etc/nginx/sites-available/
-{self.username} ALL=(root) NOPASSWD: /bin/rm /etc/nginx/sites-available/*.conf
-{self.username} ALL=(root) NOPASSWD: /bin/ln -s /etc/nginx/sites-available/* /etc/nginx/sites-enabled/
-{self.username} ALL=(root) NOPASSWD: /bin/rm /etc/nginx/sites-enabled/*.conf
-{self.username} ALL=(root) NOPASSWD: /usr/sbin/nginx -t
-{self.username} ALL=(root) NOPASSWD: /bin/systemctl reload nginx
-
-# Allow PHP-FPM pool management
-{self.username} ALL=(root) NOPASSWD: /bin/cp /tmp/*.conf /etc/php/8.3/fpm/pool.d/
-{self.username} ALL=(root) NOPASSWD: /bin/rm /etc/php/8.3/fpm/pool.d/*.conf
-{self.username} ALL=(root) NOPASSWD: /bin/systemctl reload php8.3-fpm
-{self.username} ALL=(root) NOPASSWD: /bin/systemctl restart php8.3-fpm
-
-# Allow WordPress file operations (as www-data)
-{self.username} ALL=(www-data) NOPASSWD: /bin/mkdir -p /var/www/wordpress/*
-{self.username} ALL=(www-data) NOPASSWD: /bin/chown -R www-data:www-data /var/www/wordpress/*
-{self.username} ALL=(www-data) NOPASSWD: /bin/chmod -R 775 /var/www/wordpress/*
-{self.username} ALL=(www-data) NOPASSWD: /bin/rm -rf /var/www/wordpress/*
-{self.username} ALL=(www-data) NOPASSWD: /bin/tar -xzf /tmp/*.tar.gz -C /var/www/wordpress/* --strip-components=1 --no-same-owner --no-same-permissions
-{self.username} ALL=(www-data) NOPASSWD: /usr/bin/wget -O /tmp/*.tar.gz https://wordpress.org/latest.tar.gz
-
-# Allow MySQL operations for WordPress deployment
-{self.username} ALL=(root) NOPASSWD: /usr/bin/mysql *
-SUDOERS_WP
-
-chmod 440 /etc/sudoers.d/{self.username}-wordpress
-echo "✅ WordPress deployment permissions configured"
-
 # Deploy Application
 echo ""
 echo "Deploying application..."
@@ -411,7 +337,10 @@ chown {self.username}:{self.username} /opt/hosting-manager
 
 if [ -d "/opt/hosting-manager/.git" ]; then
     cd /opt/hosting-manager
-    sudo -u {self.username} git pull origin main
+    # Force reset any local changes and pull fresh
+    sudo -u {self.username} git fetch --all
+    sudo -u {self.username} git reset --hard origin/main
+    sudo -u {self.username} git clean -fd
 else
     sudo -u {self.username} git clone {self.repo_url} /opt/hosting-manager
 fi
