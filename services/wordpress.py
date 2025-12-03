@@ -270,6 +270,14 @@ def create_php_fpm_pool(site_name):
     # Ensure PHP-FPM is running first
     ensure_php_fpm_running()
 
+    # Create PHP-FPM log directory if it doesn't exist
+    log_dir = Path("/var/log/php8.3-fpm")
+    if not log_dir.exists():
+        logger.info(f"Creating PHP-FPM log directory: {log_dir}")
+        subprocess.run(["sudo", "mkdir", "-p", str(log_dir)], check=True)
+        subprocess.run(["sudo", "chown", "www-data:www-data", str(log_dir)], check=True)
+        subprocess.run(["sudo", "chmod", "755", str(log_dir)], check=True)
+
     # Build pool configuration
     pool_config = f"""[{site_name}]
 user = www-data
