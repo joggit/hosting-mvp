@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Hosting Manager - Fresh Server Installation (Docker-Free)
-SIMPLIFIED VERSION - Assumes fresh/clean server
+Hosting Manager - Production-Ready Installation Script
+Incorporates all fixes from debugging session
 """
 
 import argparse
 import subprocess
 import sys
-import time
 import os
 from pathlib import Path
 
@@ -42,8 +41,8 @@ def print_header(message):
     print(f"{Colors.BLUE}{'='*60}{Colors.NC}\n")
 
 
-class FreshInstaller:
-    """Handles fresh server installation - No Docker, pure server blocks"""
+class ProductionInstaller:
+    """Production-ready server installation with all fixes"""
 
     def __init__(self, server, username, repo_url, root_password=None):
         if os.geteuid() == 0:
@@ -79,15 +78,14 @@ class FreshInstaller:
         return key
 
     def build_installation_script(self):
-        """Build the complete installation script"""
+        """Build the complete production installation script"""
         ssh_key_escaped = self.ssh_public_key.replace("'", "'\"'\"'")
 
         return rf"""
 set -e
 
 echo "============================================"
-echo "Hosting Manager - SIMPLIFIED Installation"
-echo "Fresh MySQL + Nginx + PHP-FPM"
+echo "Hosting Manager - Production Installation"
 echo "============================================"
 
 # ═══════════════════════════════════════════════════════════
@@ -183,11 +181,11 @@ echo "PM2: $(pm2 --version)"
 echo "✅ Node.js + PM2 installed"
 
 # ═══════════════════════════════════════════════════════════
-# STEP 7: Install MySQL Server (SIMPLIFIED - Fresh Install)
+# STEP 7: Install MySQL Server (PRODUCTION-READY)
 # ═══════════════════════════════════════════════════════════
-echo "[7/12] Installing MySQL server (fresh install)..."
+echo "[7/12] Installing MySQL server..."
 
-# Remove any existing MySQL completely
+# Clean slate - remove any existing MySQL
 systemctl stop mysql 2>/dev/null || true
 apt-get remove --purge mysql-server mysql-client mysql-common -y 2>/dev/null || true
 rm -rf /etc/mysql /var/lib/mysql /var/log/mysql
@@ -208,61 +206,53 @@ systemctl start mysql
 systemctl enable mysql
 sleep 5
 
-# Generate password
+# Generate strong password
 MYSQL_ROOT_PASS=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-25)
 
-# Create hosting group
+# Create hosting group for password file access
 groupadd -f hosting
 usermod -aG hosting {self.username}
 
 # Set root password using init file (bulletproof method)
 echo "Setting MySQL root password..."
-
-# Stop MySQL
 systemctl stop mysql
 
-# Create init file
 echo "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASS';" > /tmp/mysql-init.sql
 echo "FLUSH PRIVILEGES;" >> /tmp/mysql-init.sql
 
-# Start MySQL with init file
 mysqld --user=mysql --init-file=/tmp/mysql-init.sql &
 MYSQLD_PID=$!
-
-# Wait for it to process
 sleep 8
-
-# Stop the temporary process
 kill $MYSQLD_PID 2>/dev/null || true
 pkill -f "mysqld.*init-file" 2>/dev/null || true
 sleep 2
-
-# Clean up
 rm -f /tmp/mysql-init.sql
 
-# Start MySQL normally
 systemctl start mysql
 sleep 3
 
 # Verify password works
 if ! mysql -u root -p"$MYSQL_ROOT_PASS" -e "SELECT 1;" >/dev/null 2>&1; then
-    echo "❌ Failed to set MySQL password"
+    echo "❌ MySQL password setup failed"
     exit 1
 fi
 
 echo "✅ MySQL password set successfully"
 
-# Create users
+# Create additional users
 echo "Creating MySQL users..."
+
+mysql -u root -p"$MYSQL_ROOT_PASS" -e "DROP USER IF EXISTS 'hosting_manager'@'localhost';"
 mysql -u root -p"$MYSQL_ROOT_PASS" -e "CREATE USER 'hosting_manager'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASS';"
 mysql -u root -p"$MYSQL_ROOT_PASS" -e "GRANT ALL PRIVILEGES ON *.* TO 'hosting_manager'@'localhost' WITH GRANT OPTION;"
 
+mysql -u root -p"$MYSQL_ROOT_PASS" -e "DROP USER IF EXISTS 'wp_manager'@'localhost';"
 mysql -u root -p"$MYSQL_ROOT_PASS" -e "CREATE USER 'wp_manager'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASS';"
 mysql -u root -p"$MYSQL_ROOT_PASS" -e "GRANT CREATE, DROP, SELECT, INSERT, UPDATE, DELETE, ALTER, INDEX, CREATE TEMPORARY TABLES, LOCK TABLES ON *.* TO 'wp_manager'@'localhost';"
 
 mysql -u root -p"$MYSQL_ROOT_PASS" -e "FLUSH PRIVILEGES;"
 
-# Save password
+# Save password to files
 mkdir -p /etc/hosting-manager
 echo "$MYSQL_ROOT_PASS" > /etc/hosting-manager/mysql_root_password
 echo "$MYSQL_ROOT_PASS" > /root/.mysql_root_password
@@ -270,11 +260,23 @@ chown root:hosting /etc/hosting-manager/mysql_root_password
 chmod 640 /etc/hosting-manager/mysql_root_password
 chmod 600 /root/.mysql_root_password
 
-# Test
-if mysql -u root -p"$MYSQL_ROOT_PASS" -e "SELECT 1;" >/dev/null 2>&1; then
+# Create MySQL client config for deploy user
+mkdir -p /home/{self.username}/.mysql
+echo "[client]" > /home/{self.username}/.mysql/my.cnf
+echo "user=root" >> /home/{self.username}/.mysql/my.cnf
+echo "password=$MYSQL_ROOT_PASS" >> /home/{self.username}/.mysql/my.cnf
+echo "host=localhost" >> /home/{self.username}/.mysql/my.cnf
+chown -R {self.username}:{self.username} /home/{self.username}/.mysql
+chmod 700 /home/{self.username}/.mysql
+chmod 600 /home/{self.username}/.mysql/my.cnf
+
+# Final verification
+if mysql -u root -p"$MYSQL_ROOT_PASS" -e "SELECT 'MySQL Ready' as status;" 2>/dev/null | grep -q "MySQL Ready"; then
     echo "✅ MySQL installed and configured"
+    echo "   Users created: root, hosting_manager, wp_manager"
+    echo "   Password saved: /etc/hosting-manager/mysql_root_password"
 else
-    echo "❌ MySQL test failed"
+    echo "❌ MySQL verification failed"
     exit 1
 fi
 
@@ -286,10 +288,16 @@ apt-get install -y php8.3 php8.3-fpm php8.3-mysql php8.3-curl php8.3-gd \
     php8.3-mbstring php8.3-xml php8.3-xmlrpc php8.3-soap php8.3-intl \
     php8.3-zip php8.3-cli php8.3-imagick
 
+# PHP configuration
 sed -i 's/;cgi.fix_pathinfo=1/cgi.fix_pathinfo=0/' /etc/php/8.3/fpm/php.ini
 sed -i 's/upload_max_filesize = .*/upload_max_filesize = 64M/' /etc/php/8.3/fpm/php.ini
 sed -i 's/post_max_size = .*/post_max_size = 64M/' /etc/php/8.3/fpm/php.ini
 sed -i 's/memory_limit = .*/memory_limit = 256M/' /etc/php/8.3/fpm/php.ini
+
+# Create PHP-FPM log directory (CRITICAL FIX)
+mkdir -p /var/log/php8.3-fpm
+chown www-data:www-data /var/log/php8.3-fpm
+chmod 755 /var/log/php8.3-fpm
 
 systemctl start php8.3-fpm
 systemctl enable php8.3-fpm
@@ -314,6 +322,13 @@ echo "✅ WP-CLI installed"
 echo "[10/12] Installing Python dependencies..."
 apt-get install -y python3 python3-pip python3-venv nginx sqlite3
 pip3 install --break-system-packages Flask==3.0.0 Flask-CORS==4.0.0 PyMySQL==1.1.0 2>&1 | grep -v "WARNING" || true
+
+# Configure Nginx to run as www-data (CRITICAL FIX)
+sed -i 's/^user .*/user www-data;/' /etc/nginx/nginx.conf
+if ! grep -q "^user www-data;" /etc/nginx/nginx.conf; then
+    sed -i '1iuser www-data;' /etc/nginx/nginx.conf
+fi
+
 echo "✅ Python + Nginx installed"
 
 # ═══════════════════════════════════════════════════════════
@@ -331,17 +346,17 @@ chown -R {self.username}:{self.username} /var/log/hosting-manager
 chown -R {self.username}:{self.username} /var/www/domains
 chown -R www-data:www-data /var/www/wordpress
 
+# Add deploy user to www-data group
 usermod -aG www-data {self.username}
 
+# Set proper permissions on WordPress directory
 chmod -R 2775 /var/www/wordpress
 
 mkdir -p /run/nginx
 chown -R www-data:www-data /run/nginx
 chmod -R 755 /run/nginx
 
-sed -i '/^user /d' /etc/nginx/nginx.conf
-
-chmod -R 755 /var/www/domains
+# Make nginx config directories writable
 chmod 775 /etc/nginx/sites-available
 chmod 775 /etc/nginx/sites-enabled
 chmod 775 /etc/php/8.3/fpm/pool.d
@@ -438,18 +453,21 @@ echo "Test:"
 echo "  ssh {self.username}@{self.server}"
 echo "  curl http://{self.server}:5000/api/health"
 echo ""
-echo "⚠️  IMPORTANT: Log out and log back in!"
+echo "MySQL:"
+echo "  Password: $(cat /etc/hosting-manager/mysql_root_password)"
+echo ""
+echo "⚠️  IMPORTANT: Log out and log back in for group changes!"
 echo ""
 """
 
     def install(self):
         """Run installation"""
-        print_header("🚀 Hosting Manager - Simplified Installation")
+        print_header("🚀 Hosting Manager - Production Installation")
         print(f"Server:     {self.server}")
         print(f"User:       {self.username}")
         print(f"Repository: {self.repo_url}")
         print()
-        print_warning("This will REMOVE any existing MySQL installation!")
+        print_warning("This will completely reset MySQL and start fresh!")
         print()
 
         response = input("Continue? (yes/no): ")
@@ -460,7 +478,7 @@ echo ""
         install_script = self.build_installation_script()
 
         print_step("Starting installation...")
-        print_warning("This will take several minutes...")
+        print_warning("This will take 5-10 minutes...")
         print()
 
         try:
@@ -495,6 +513,18 @@ echo ""
 
             print()
             print_header("✅ Installation Successful!")
+            print()
+            print_success("Next steps:")
+            print("  1. Log out and log back in as deploy user")
+            print("  2. Test: curl http://localhost:5000/api/health")
+            print(
+                "  3. Deploy WordPress: curl -X POST http://localhost:5000/api/wordpress/deploy \\"
+            )
+            print('       -H "Content-Type: application/json" \\')
+            print(
+                '       -d \'{"name":"site","domain":"example.com","adminEmail":"admin@example.com","adminPassword":"pass","siteTitle":"Site"}\''
+            )
+            print()
 
         except Exception as e:
             print_error(f"Installation failed: {e}")
@@ -502,9 +532,7 @@ echo ""
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Fresh server installation - SIMPLIFIED (removes existing MySQL)"
-    )
+    parser = argparse.ArgumentParser(description="Production-ready server installation")
     parser.add_argument("--server", required=True, help="Server IP address")
     parser.add_argument("--user", required=True, help="Username (e.g., deploy)")
     parser.add_argument("--repo", required=True, help="Git repository URL")
@@ -512,7 +540,7 @@ def main():
 
     args = parser.parse_args()
 
-    installer = FreshInstaller(
+    installer = ProductionInstaller(
         server=args.server,
         username=args.user,
         repo_url=args.repo,
