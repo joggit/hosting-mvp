@@ -210,9 +210,11 @@ def create_mysql_database(db_name, db_user, db_password):
         f"CREATE DATABASE IF NOT EXISTS `{db_name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
     )
 
-    # Create user if not exists (separate commands)
+    # Drop user if exists, then create (ensures password is set correctly)
+    run_mysql_query(f"DROP USER IF EXISTS '{db_user}'@'localhost';")
+
     run_mysql_query(
-        f"CREATE USER IF NOT EXISTS '{db_user}'@'localhost' IDENTIFIED BY '{db_password}';"
+        f"CREATE USER '{db_user}'@'localhost' IDENTIFIED BY '{db_password}';"
     )
 
     run_mysql_query(
