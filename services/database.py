@@ -15,6 +15,7 @@ def init_database():
 
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     cursor = conn.cursor()
 
     cursor.executescript(
@@ -51,7 +52,22 @@ def init_database():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         
-    
+        -- ═══════════════════════════════════════════════════════════
+        -- WordPress Tables (Traditional - No Docker)
+        -- ═══════════════════════════════════════════════════════════
+        
+        CREATE TABLE IF NOT EXISTS wordpress_sites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            site_name TEXT NOT NULL UNIQUE,
+            domain TEXT NOT NULL,
+            admin_email TEXT NOT NULL,
+            site_path TEXT,
+            status TEXT DEFAULT 'running',
+            mysql_database TEXT,
+            mysql_user TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        
         CREATE TABLE IF NOT EXISTS wordpress_plugins (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             site_id INTEGER NOT NULL,
@@ -82,19 +98,6 @@ def init_database():
             executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (site_id) REFERENCES wordpress_sites(id) ON DELETE CASCADE
         );
-
-        CREATE TABLE IF NOT EXISTS wordpress_sites (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            site_name TEXT NOT NULL UNIQUE,
-            domain TEXT NOT NULL,
-            admin_email TEXT NOT NULL,
-            site_path TEXT,
-            status TEXT DEFAULT 'running',
-            mysql_database TEXT,
-            mysql_user TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
         
         -- ═══════════════════════════════════════════════════════════
         -- Indexes for Performance
@@ -110,7 +113,6 @@ def init_database():
         CREATE INDEX IF NOT EXISTS idx_wp_plugins_site ON wordpress_plugins(site_id);
         CREATE INDEX IF NOT EXISTS idx_wp_themes_site ON wordpress_themes(site_id);
         CREATE INDEX IF NOT EXISTS idx_wp_cli_history_site ON wordpress_cli_history(site_id);
-        
     """
     )
 
@@ -125,5 +127,8 @@ def init_database():
 
 
 def get_db():
-    """Get database connection"""
-    return sqlite3.connect(CONFIG["database_path"], timeout=30.0)
+    """Get database connection with WAL mode and timeout"""
+    conn = sqlite3.connect(CONFIG["database_path"], timeout=30.0)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
