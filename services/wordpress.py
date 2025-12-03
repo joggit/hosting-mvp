@@ -431,13 +431,16 @@ def delete_nginx_config(site_name):
 
 
 def download_wordpress(site_dir):
-    """Download and extract WordPress core - FIXED VERSION"""
+    """Download and extract WordPress core"""
     site_dir.mkdir(parents=True, exist_ok=True)
 
-    # Download WordPress
-    wp_zip = site_dir.parent / "wordpress-latest.tar.gz"
-    logger.info("Downloading WordPress...")
+    # Download WordPress to temp location
+    import tempfile
 
+    temp_dir = Path(tempfile.gettempdir())
+    wp_zip = temp_dir / f"wordpress-{site_dir.name}.tar.gz"
+
+    logger.info("Downloading WordPress...")
     result = subprocess.run(
         ["wget", "https://wordpress.org/latest.tar.gz", "-O", str(wp_zip), "-q"],
         capture_output=True,
@@ -447,21 +450,16 @@ def download_wordpress(site_dir):
     if result.returncode != 0:
         raise Exception(f"Failed to download WordPress: {result.stderr}")
 
-    # Extract WordPress WITH FIXED FLAGS
+    # Extract WordPress to site directory
     logger.info("Extracting WordPress...")
     result = subprocess.run(
         [
-            "sudo",
-            "-u",
-            "www-data",  # Run as www-data user
             "tar",
             "-xzf",
             str(wp_zip),
             "-C",
-            str(site_dir.parent),
+            str(site_dir),
             "--strip-components=1",
-            "--no-same-owner",  # FIX: Don't preserve ownership
-            "--no-same-permissions",  # FIX: Don't preserve setgid permissions
         ],
         capture_output=True,
         text=True,
@@ -470,7 +468,7 @@ def download_wordpress(site_dir):
     if result.returncode != 0:
         raise Exception(f"Failed to extract WordPress: {result.stderr}")
 
-    # Fix ownership after extraction
+    # Fix ownership
     subprocess.run(
         ["sudo", "chown", "-R", "www-data:www-data", str(site_dir)], check=True
     )
