@@ -210,14 +210,17 @@ def create_mysql_database(db_name, db_user, db_password):
         f"CREATE DATABASE IF NOT EXISTS `{db_name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
     )
 
-    # Create user if not exists
+    # Create user if not exists (separate commands)
     run_mysql_query(
-        f"""
-        CREATE USER IF NOT EXISTS '{db_user}'@'localhost' IDENTIFIED BY '{db_password}';
-        GRANT ALL PRIVILEGES ON `{db_name}`.* TO '{db_user}'@'localhost';
-        FLUSH PRIVILEGES;
-        """
+        f"CREATE USER IF NOT EXISTS '{db_user}'@'localhost' IDENTIFIED BY '{db_password}';"
     )
+
+    run_mysql_query(
+        f"GRANT ALL PRIVILEGES ON `{db_name}`.* TO '{db_user}'@'localhost';"
+    )
+
+    run_mysql_query("FLUSH PRIVILEGES;")
+
     logger.info(f"✅ Database {db_name} created")
 
 
