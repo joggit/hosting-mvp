@@ -51,27 +51,7 @@ def init_database():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         
-        -- ═══════════════════════════════════════════════════════════
-        -- WordPress Tables (Docker-based WordPress Deployments)
-        -- ═══════════════════════════════════════════════════════════
-        
-        CREATE TABLE IF NOT EXISTS wordpress_sites (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            site_name TEXT UNIQUE NOT NULL,
-            domain TEXT UNIQUE NOT NULL,
-            port INTEGER UNIQUE NOT NULL,
-            container_name TEXT UNIQUE NOT NULL,
-            mysql_container TEXT NOT NULL,
-            cli_container TEXT NOT NULL,
-            admin_email TEXT NOT NULL,
-            wp_version TEXT DEFAULT 'latest',
-            php_version TEXT DEFAULT '8.1',
-            status TEXT DEFAULT 'running',
-            docker_compose_path TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        
+    
         CREATE TABLE IF NOT EXISTS wordpress_plugins (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             site_id INTEGER NOT NULL,
