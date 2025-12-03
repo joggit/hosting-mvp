@@ -329,6 +329,12 @@ def delete_php_fpm_pool(site_name):
 # ============================================================================
 
 
+"""
+Fixed Nginx functions for services/wordpress.py
+Replace the existing create_nginx_config and delete_nginx_config functions
+"""
+
+
 def create_nginx_config(site_name, domain):
     """Create Nginx server block for WordPress site"""
     site_root = WORDPRESS_BASE_DIR / site_name
@@ -390,10 +396,11 @@ def create_nginx_config(site_name, domain):
         enabled_link.unlink()
     enabled_link.symlink_to(config_file)
 
-    # Test and reload Nginx
-    nginx_test = subprocess.run(["nginx", "-t"], capture_output=True, text=True)
+    # Test and reload Nginx (with sudo)
+    nginx_test = subprocess.run(["sudo", "nginx", "-t"], capture_output=True, text=True)
+
     if nginx_test.returncode == 0:
-        subprocess.run(["systemctl", "reload", "nginx"], check=True)
+        subprocess.run(["sudo", "systemctl", "reload", "nginx"], check=True)
         logger.info(f"✅ Nginx config created for {domain}")
     else:
         logger.error(f"Nginx config test failed: {nginx_test.stderr}")
@@ -412,8 +419,9 @@ def delete_nginx_config(site_name):
     if config_file.exists():
         config_file.unlink()
 
-    # Reload Nginx
-    subprocess.run(["systemctl", "reload", "nginx"], check=False)
+    # Reload Nginx (with sudo)
+    subprocess.run(["sudo", "systemctl", "reload", "nginx"], check=False)
+
     logger.info(f"✅ Nginx config deleted: {site_name}")
 
 
