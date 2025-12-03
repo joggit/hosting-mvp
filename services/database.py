@@ -102,6 +102,20 @@ def init_database():
             executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (site_id) REFERENCES wordpress_sites(id) ON DELETE CASCADE
         );
+        # WordPress Sites table
+
+        CREATE TABLE IF NOT EXISTS wordpress_sites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            site_name TEXT NOT NULL UNIQUE,
+            domain TEXT NOT NULL,
+            admin_email TEXT NOT NULL,
+            site_path TEXT,
+            status TEXT DEFAULT 'running',
+            mysql_database TEXT,
+            mysql_user TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
         
         -- ═══════════════════════════════════════════════════════════
         -- Indexes for Performance
