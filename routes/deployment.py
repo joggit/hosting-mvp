@@ -189,12 +189,12 @@ def register_routes(app):
                 project_files[
                     "next.config.js"
                 ] = """/** @type {import('next').NextConfig} */
-            const nextConfig = {
-            reactStrictMode: true,
-            swcMinify: true,
-            };
+const nextConfig = {
+  reactStrictMode: true,
+  swcMinify: true,
+};
 
-            module.exports = nextConfig;"""
+module.exports = nextConfig;"""
                 app.logger.info("Added next.config.js")
             else:
                 # Check if next.config.js has incompatible options
@@ -221,8 +221,6 @@ const nextConfig = {
 };
 
 module.exports = nextConfig;"""
-
-                app.logger.info("Added next.config.js")
 
             # ═══════════════════════════════════════════════════════════
             # STEP 4: Port allocation
@@ -504,63 +502,65 @@ module.exports = nextConfig;"""
             conn = get_db()
             cursor = conn.cursor()
 
-        # Save domain (without port - it's tracked in processes)
-        if full_domain:
-            # Check if domain already exists
-            cursor.execute("SELECT id FROM domains WHERE domain_name = ?", (full_domain,))
-            existing = cursor.fetchone()
-            
-            if existing:
-                # Update existing domain
+            # Save domain (without port - it's tracked in processes)
+            if full_domain:
+                # Check if domain already exists
+                cursor.execute(
+                    "SELECT id FROM domains WHERE domain_name = ?", (full_domain,)
+                )
+                existing = cursor.fetchone()
+
+                if existing:
+                    # Update existing domain
+                    cursor.execute(
+                        """
+                        UPDATE domains 
+                        SET app_name = ?, ssl_enabled = ?, status = 'active'
+                        WHERE domain_name = ?
+                        """,
+                        (site_name, False, full_domain),
+                    )
+                else:
+                    # Insert new domain (without port column)
+                    cursor.execute(
+                        """
+                        INSERT INTO domains (domain_name, app_name, ssl_enabled, status)
+                        VALUES (?, ?, ?, 'active')
+                        """,
+                        (full_domain, site_name, False),
+                    )
+
+            # Save process
+            # Check if process already exists
+            cursor.execute("SELECT id FROM processes WHERE name = ?", (site_name,))
+            existing_process = cursor.fetchone()
+
+            if existing_process:
+                # Update existing process
                 cursor.execute(
                     """
-                    UPDATE domains 
-                    SET app_name = ?, ssl_enabled = ?, status = 'active'
-                    WHERE domain_name = ?
+                    UPDATE processes 
+                    SET port = ?, status = 'running'
+                    WHERE name = ?
                     """,
-                    (site_name, False, full_domain),
+                    (allocated_port, site_name),
                 )
             else:
-                # Insert new domain (without port column)
+                # Insert new process
                 cursor.execute(
                     """
-                    INSERT INTO domains (domain_name, app_name, ssl_enabled, status)
-                    VALUES (?, ?, ?, 'active')
+                    INSERT INTO processes (name, port, status)
+                    VALUES (?, ?, 'running')
                     """,
-                    (full_domain, site_name, False),
+                    (site_name, allocated_port),
                 )
-
-        # Save process
-        # Check if process already exists
-        cursor.execute("SELECT id FROM processes WHERE name = ?", (site_name,))
-        existing_process = cursor.fetchone()
-
-        if existing_process:
-            # Update existing process
-            cursor.execute(
-                """
-                UPDATE processes 
-                SET port = ?, status = 'running'
-                WHERE name = ?
-                """,
-                (allocated_port, site_name),
-            )
-        else:
-            # Insert new process
-            cursor.execute(
-                """
-                INSERT INTO processes (name, port, status)
-                VALUES (?, ?, 'running')
-                """,
-                (site_name, allocated_port),
-            )
 
             # Log deployment
             cursor.execute(
                 """
                 INSERT INTO deployment_logs (domain_name, action, status, message)
                 VALUES (?, 'deploy', 'success', ?)
-            """,
+                """,
                 (full_domain or site_name, f"Deployed {deployment_type} application"),
             )
 
@@ -615,7 +615,86 @@ module.exports = nextConfig;"""
             return jsonify({"success": False, "error": str(e)}), 500
 
     # ============================================================
-    # GET: Fetch info about a deployed Node.js/Next.js site
+    # GET: List all Node.js/Next.js sites
+    # ============================================================
+    @app.route("/api/deploy/nodejs", methods=["GET"])
+    def list_nodejs_sites():
+        """Returns a JSON list of all deployed Node.js/Next.js applications"""
+        try:
+            conn = get_db()
+            cursor = conn.cursor()
+
+            # Fetch all processes
+            cursor.execute("SELECT id, name, port, status FROM processes")
+            process_rows = cursor.fetchall()
+
+            # Fetch all domains mapped by app_name
+            cursor.execute(
+                "SELECT domain_name, app_name, ssl_enabled, status FROM domains"
+            )
+            domain_rows = cursor.fetchall()
+
+            # Domain lookup table for fast matching
+            domains_by_app = {}
+            for domain_name, app_name, ssl_enabled, status in domain_rows:
+                domains_by_app.setdefault(app_name, []).append(
+                    {
+                        "domain_name": domain_name,
+                        "ssl_enabled": bool(ssl_enabled),
+                        "status": status,
+                        "url": f"http://{domain_name}",
+                    }
+                )
+
+            conn.close()
+
+            pm2_path = shutil.which("pm2") or "/usr/bin/pm2"
+            pm2_available = os.path.exists(pm2_path)
+
+            site_list = []
+
+            for proc_id, site_name, port, proc_status in process_rows:
+                app_dir = Path(CONFIG["web_root"]) / site_name
+
+                # Check if PM2 process is running
+                pm2_running = False
+                if pm2_available:
+                    try:
+                        pm2_res = subprocess.run(
+                            [pm2_path, "describe", site_name],
+                            capture_output=True,
+                            text=True,
+                        )
+                        pm2_running = "online" in pm2_res.stdout.lower()
+                    except Exception:
+                        pass
+
+                # Attach domain info (may be multiple domains)
+                domain_info = domains_by_app.get(site_name, None)
+
+                site_list.append(
+                    {
+                        "site_name": site_name,
+                        "port": port,
+                        "process_status": proc_status,
+                        "files_path": str(app_dir),
+                        "exists_on_disk": app_dir.exists(),
+                        "pm2": {
+                            "available": pm2_available,
+                            "running": pm2_running,
+                        },
+                        "domains": domain_info,
+                    }
+                )
+
+            return jsonify({"success": True, "sites": site_list})
+
+        except Exception as e:
+            app.logger.error(f"Error listing NodeJS sites: {e}")
+            return jsonify({"success": False, "error": str(e)}), 500
+
+    # ============================================================
+    # GET: Fetch info about specific site
     # ============================================================
     @app.route("/api/deploy/nodejs/<site_name>", methods=["GET"])
     def get_nodejs_site(site_name):
@@ -718,91 +797,6 @@ module.exports = nextConfig;"""
         except Exception as e:
             app.logger.error(f"Error fetching site info for {site_name}: {e}")
             return jsonify({"success": False, "error": str(e)}), 500
-        
-        # ============================================================
-    # LIST ALL DEPLOYED NODEJS/NEXTJS SITES
-    # ============================================================
-    @app.route("/api/deploy/nodejs", methods=["GET"])
-    def list_nodejs_sites():
-        """
-        Returns a JSON list of all deployed Node.js/Next.js applications.
-        Includes:
-         - process info
-         - domain info
-         - filesystem path
-         - PM2 status (if available)
-        """
-        try:
-            conn = get_db()
-            cursor = conn.cursor()
-
-            # Fetch all processes
-            cursor.execute("SELECT id, name, port, status FROM processes")
-            process_rows = cursor.fetchall()
-
-            # Fetch all domains mapped by app_name
-            cursor.execute("SELECT domain_name, app_name, ssl_enabled, status FROM domains")
-            domain_rows = cursor.fetchall()
-
-            # Domain lookup table for fast matching
-            domains_by_app = {}
-            for domain_name, app_name, ssl_enabled, status in domain_rows:
-                domains_by_app.setdefault(app_name, []).append(
-                    {
-                        "domain_name": domain_name,
-                        "ssl_enabled": bool(ssl_enabled),
-                        "status": status,
-                        "url": f"http://{domain_name}",
-                    }
-                )
-
-            conn.close()
-
-            pm2_path = shutil.which("pm2") or "/usr/bin/pm2"
-            pm2_available = os.path.exists(pm2_path)
-
-            site_list = []
-
-            for proc_id, site_name, port, proc_status in process_rows:
-                app_dir = Path(CONFIG["web_root"]) / site_name
-
-                # Check if PM2 process is running
-                pm2_running = False
-                if pm2_available:
-                    try:
-                        pm2_res = subprocess.run(
-                            [pm2_path, "describe", site_name],
-                            capture_output=True,
-                            text=True,
-                        )
-                        pm2_running = "online" in pm2_res.stdout.lower()
-                    except Exception:
-                        pass
-
-                # Attach domain info (may be multiple domains)
-                domain_info = domains_by_app.get(site_name, None)
-
-                site_list.append(
-                    {
-                        "site_name": site_name,
-                        "port": port,
-                        "process_status": proc_status,
-                        "files_path": str(app_dir),
-                        "exists_on_disk": app_dir.exists(),
-                        "pm2": {
-                            "available": pm2_available,
-                            "running": pm2_running,
-                        },
-                        "domains": domain_info,
-                    }
-                )
-
-            return jsonify({"success": True, "sites": site_list})
-
-        except Exception as e:
-            app.logger.error(f"Error listing NodeJS sites: {e}")
-            return jsonify({"success": False, "error": str(e)}), 500
-
 
     # ============================================================
     # DELETE: Fully remove a Node.js/Next.js site
@@ -892,7 +886,9 @@ module.exports = nextConfig;"""
 
                 try:
                     if nginx_enabled_conf.exists():
-                        app.logger.info(f"Removing nginx enabled site: {nginx_enabled_conf}")
+                        app.logger.info(
+                            f"Removing nginx enabled site: {nginx_enabled_conf}"
+                        )
                         subprocess.run(
                             ["sudo", "rm", "-f", str(nginx_enabled_conf)],
                             check=False,
