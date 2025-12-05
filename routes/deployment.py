@@ -718,6 +718,91 @@ module.exports = nextConfig;"""
         except Exception as e:
             app.logger.error(f"Error fetching site info for {site_name}: {e}")
             return jsonify({"success": False, "error": str(e)}), 500
+        
+        # ============================================================
+    # LIST ALL DEPLOYED NODEJS/NEXTJS SITES
+    # ============================================================
+    @app.route("/api/deploy/nodejs", methods=["GET"])
+    def list_nodejs_sites():
+        """
+        Returns a JSON list of all deployed Node.js/Next.js applications.
+        Includes:
+         - process info
+         - domain info
+         - filesystem path
+         - PM2 status (if available)
+        """
+        try:
+            conn = get_db()
+            cursor = conn.cursor()
+
+            # Fetch all processes
+            cursor.execute("SELECT id, name, port, status FROM processes")
+            process_rows = cursor.fetchall()
+
+            # Fetch all domains mapped by app_name
+            cursor.execute("SELECT domain_name, app_name, ssl_enabled, status FROM domains")
+            domain_rows = cursor.fetchall()
+
+            # Domain lookup table for fast matching
+            domains_by_app = {}
+            for domain_name, app_name, ssl_enabled, status in domain_rows:
+                domains_by_app.setdefault(app_name, []).append(
+                    {
+                        "domain_name": domain_name,
+                        "ssl_enabled": bool(ssl_enabled),
+                        "status": status,
+                        "url": f"http://{domain_name}",
+                    }
+                )
+
+            conn.close()
+
+            pm2_path = shutil.which("pm2") or "/usr/bin/pm2"
+            pm2_available = os.path.exists(pm2_path)
+
+            site_list = []
+
+            for proc_id, site_name, port, proc_status in process_rows:
+                app_dir = Path(CONFIG["web_root"]) / site_name
+
+                # Check if PM2 process is running
+                pm2_running = False
+                if pm2_available:
+                    try:
+                        pm2_res = subprocess.run(
+                            [pm2_path, "describe", site_name],
+                            capture_output=True,
+                            text=True,
+                        )
+                        pm2_running = "online" in pm2_res.stdout.lower()
+                    except Exception:
+                        pass
+
+                # Attach domain info (may be multiple domains)
+                domain_info = domains_by_app.get(site_name, None)
+
+                site_list.append(
+                    {
+                        "site_name": site_name,
+                        "port": port,
+                        "process_status": proc_status,
+                        "files_path": str(app_dir),
+                        "exists_on_disk": app_dir.exists(),
+                        "pm2": {
+                            "available": pm2_available,
+                            "running": pm2_running,
+                        },
+                        "domains": domain_info,
+                    }
+                )
+
+            return jsonify({"success": True, "sites": site_list})
+
+        except Exception as e:
+            app.logger.error(f"Error listing NodeJS sites: {e}")
+            return jsonify({"success": False, "error": str(e)}), 500
+
 
     # ============================================================
     # DELETE: Fully remove a Node.js/Next.js site
