@@ -504,22 +504,54 @@ module.exports = nextConfig;"""
             conn = get_db()
             cursor = conn.cursor()
 
-            # Save domain
-            if full_domain:
+        # Save domain (without port - it's tracked in processes)
+        if full_domain:
+            # Check if domain already exists
+            cursor.execute("SELECT id FROM domains WHERE domain_name = ?", (full_domain,))
+            existing = cursor.fetchone()
+            
+            if existing:
+                # Update existing domain
                 cursor.execute(
                     """
-                    INSERT INTO domains (domain_name, port, app_name, ssl_enabled, status)
-                    VALUES (?, ?, ?, ?, 'active')
-                """,
-                    (full_domain, allocated_port, site_name, False),
+                    UPDATE domains 
+                    SET app_name = ?, ssl_enabled = ?, status = 'active'
+                    WHERE domain_name = ?
+                    """,
+                    (site_name, False, full_domain),
+                )
+            else:
+                # Insert new domain (without port column)
+                cursor.execute(
+                    """
+                    INSERT INTO domains (domain_name, app_name, ssl_enabled, status)
+                    VALUES (?, ?, ?, 'active')
+                    """,
+                    (full_domain, site_name, False),
                 )
 
-            # Save process
+        # Save process
+        # Check if process already exists
+        cursor.execute("SELECT id FROM processes WHERE name = ?", (site_name,))
+        existing_process = cursor.fetchone()
+
+        if existing_process:
+            # Update existing process
+            cursor.execute(
+                """
+                UPDATE processes 
+                SET port = ?, status = 'running'
+                WHERE name = ?
+                """,
+                (allocated_port, site_name),
+            )
+        else:
+            # Insert new process
             cursor.execute(
                 """
                 INSERT INTO processes (name, port, status)
                 VALUES (?, ?, 'running')
-            """,
+                """,
                 (site_name, allocated_port),
             )
 
@@ -580,4 +612,302 @@ module.exports = nextConfig;"""
             import traceback
 
             traceback.print_exc()
+            return jsonify({"success": False, "error": str(e)}), 500
+
+    # ============================================================
+    # GET: Fetch info about a deployed Node.js/Next.js site
+    # ============================================================
+    @app.route("/api/deploy/nodejs/<site_name>", methods=["GET"])
+    def get_nodejs_site(site_name):
+        """Return information about a deployed Node.js/Next.js site"""
+        try:
+            conn = get_db()
+            cursor = conn.cursor()
+
+            # Look up process info
+            cursor.execute(
+                "SELECT port, status FROM processes WHERE name = ?",
+                (site_name,),
+            )
+            process_row = cursor.fetchone()
+
+            if not process_row:
+                conn.close()
+                return (
+                    jsonify(
+                        {
+                            "success": False,
+                            "error": f"No process entry found for site '{site_name}'",
+                        }
+                    ),
+                    404,
+                )
+
+            port, proc_status = process_row
+
+            # Look up domain info (may or may not exist)
+            cursor.execute(
+                "SELECT domain_name, ssl_enabled, status FROM domains WHERE app_name = ?",
+                (site_name,),
+            )
+            domain_row = cursor.fetchone()
+            conn.close()
+
+            domain_info = None
+            nginx_available = False
+            nginx_enabled = False
+
+            if domain_row:
+                domain_name, ssl_enabled, domain_status = domain_row
+                domain_info = {
+                    "domain_name": domain_name,
+                    "ssl_enabled": bool(ssl_enabled),
+                    "status": domain_status,
+                    "url": f"http://{domain_name}",
+                }
+
+                nginx_conf = Path(f"/etc/nginx/sites-available/{domain_name}")
+                nginx_enabled_conf = Path(f"/etc/nginx/sites-enabled/{domain_name}")
+                nginx_available = nginx_conf.exists()
+                nginx_enabled = nginx_enabled_conf.exists()
+
+            # Filesystem info
+            app_dir = Path(CONFIG["web_root"]) / site_name
+            app_dir_exists = app_dir.exists()
+
+            # PM2 status (if available)
+            pm2_path = shutil.which("pm2") or "/usr/bin/pm2"
+            pm2_running = False
+            pm2_status_output = None
+
+            if os.path.exists(pm2_path):
+                try:
+                    pm2_result = subprocess.run(
+                        [pm2_path, "describe", site_name],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if pm2_result.returncode == 0:
+                        pm2_status_output = pm2_result.stdout
+                        pm2_running = "online" in pm2_result.stdout.lower()
+                except Exception:
+                    # PM2 not critical here; ignore errors
+                    pass
+
+            return jsonify(
+                {
+                    "success": True,
+                    "site_name": site_name,
+                    "port": port,
+                    "process_status": proc_status,
+                    "app_dir": str(app_dir),
+                    "app_dir_exists": app_dir_exists,
+                    "domain": domain_info,
+                    "nginx": {
+                        "has_config": nginx_available,
+                        "is_enabled": nginx_enabled,
+                    },
+                    "pm2": {
+                        "available": os.path.exists(pm2_path),
+                        "running": pm2_running,
+                        "raw_status": pm2_status_output,
+                    },
+                }
+            )
+
+        except Exception as e:
+            app.logger.error(f"Error fetching site info for {site_name}: {e}")
+            return jsonify({"success": False, "error": str(e)}), 500
+
+    # ============================================================
+    # DELETE: Fully remove a Node.js/Next.js site
+    # ============================================================
+    @app.route("/api/deploy/nodejs/<site_name>", methods=["DELETE"])
+    def delete_nodejs_site(site_name):
+        """
+        Completely remove a Node.js/Next.js site:
+        - Stop & delete PM2 process
+        - Remove nginx vhost (available + enabled)
+        - Delete app files from web_root
+        - Remove SQLite entries (domains, processes, logs)
+        """
+        try:
+            conn = get_db()
+            cursor = conn.cursor()
+
+            # Fetch process info
+            cursor.execute(
+                "SELECT id, port FROM processes WHERE name = ?",
+                (site_name,),
+            )
+            process_row = cursor.fetchone()
+
+            if not process_row:
+                conn.close()
+                return (
+                    jsonify(
+                        {
+                            "success": False,
+                            "error": f"No process entry found for site '{site_name}'",
+                        }
+                    ),
+                    404,
+                )
+
+            process_id, port = process_row
+
+            # Fetch domain info (optional)
+            cursor.execute(
+                "SELECT id, domain_name FROM domains WHERE app_name = ?",
+                (site_name,),
+            )
+            domain_row = cursor.fetchone()
+
+            domain_id = None
+            domain_name = None
+            if domain_row:
+                domain_id, domain_name = domain_row
+
+            app.logger.info("═══════════════════════════════════════")
+            app.logger.info(f"🗑 Starting deletion for {site_name}")
+            app.logger.info(f"Process ID: {process_id}, Port: {port}")
+            if domain_name:
+                app.logger.info(f"Domain: {domain_name}")
+            app.logger.info("═══════════════════════════════════════")
+
+            # 1) Stop & delete PM2 process
+            pm2_path = shutil.which("pm2") or "/usr/bin/pm2"
+            if os.path.exists(pm2_path):
+                try:
+                    app.logger.info(f"Stopping PM2 process for {site_name}...")
+                    subprocess.run(
+                        [pm2_path, "stop", site_name],
+                        capture_output=True,
+                        text=True,
+                    )
+
+                    app.logger.info(f"Deleting PM2 process for {site_name}...")
+                    subprocess.run(
+                        [pm2_path, "delete", site_name],
+                        capture_output=True,
+                        text=True,
+                    )
+
+                    # Save PM2 state
+                    subprocess.run([pm2_path, "save"], capture_output=True, text=True)
+
+                    app.logger.info("✅ PM2 process removed")
+                except Exception as e:
+                    app.logger.warning(f"PM2 cleanup failed (non-fatal): {e}")
+
+            # 2) Remove nginx config (if domain exists)
+            if domain_name:
+                nginx_conf = Path(f"/etc/nginx/sites-available/{domain_name}")
+                nginx_enabled_conf = Path(f"/etc/nginx/sites-enabled/{domain_name}")
+
+                try:
+                    if nginx_enabled_conf.exists():
+                        app.logger.info(f"Removing nginx enabled site: {nginx_enabled_conf}")
+                        subprocess.run(
+                            ["sudo", "rm", "-f", str(nginx_enabled_conf)],
+                            check=False,
+                        )
+
+                    if nginx_conf.exists():
+                        app.logger.info(f"Removing nginx available site: {nginx_conf}")
+                        subprocess.run(
+                            ["sudo", "rm", "-f", str(nginx_conf)],
+                            check=False,
+                        )
+
+                    # Test and reload nginx if configs changed
+                    app.logger.info("Reloading nginx...")
+                    test_result = subprocess.run(
+                        ["sudo", "nginx", "-t"],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if test_result.returncode == 0:
+                        subprocess.run(
+                            ["sudo", "systemctl", "reload", "nginx"],
+                            capture_output=True,
+                            text=True,
+                        )
+                        app.logger.info("✅ Nginx reloaded")
+                    else:
+                        app.logger.error(
+                            f"Nginx test failed after deletion: {test_result.stderr}"
+                        )
+                except Exception as e:
+                    app.logger.warning(f"Nginx cleanup failed (non-fatal): {e}")
+
+            # 3) Remove app files
+            app_dir = Path(CONFIG["web_root"]) / site_name
+            if app_dir.exists():
+                try:
+                    app.logger.info(f"Removing app directory: {app_dir}")
+                    shutil.rmtree(app_dir)
+                    app.logger.info("✅ App directory removed")
+                except Exception as e:
+                    app.logger.warning(f"App directory cleanup failed (non-fatal): {e}")
+
+            # 4) Remove SQLite entries (domains, processes, logs)
+            try:
+                if domain_name:
+                    cursor.execute(
+                        "DELETE FROM domains WHERE id = ?",
+                        (domain_id,),
+                    )
+
+                cursor.execute(
+                    "DELETE FROM processes WHERE id = ?",
+                    (process_id,),
+                )
+
+                # Optional: log deletion
+                cursor.execute(
+                    """
+                    INSERT INTO deployment_logs (domain_name, action, status, message)
+                    VALUES (?, 'delete', 'success', ?)
+                    """,
+                    (domain_name or site_name, f"Deleted application {site_name}"),
+                )
+
+                conn.commit()
+                conn.close()
+                app.logger.info("✅ Database entries cleaned up")
+            except Exception as e:
+                app.logger.error(f"Database cleanup failed: {e}")
+                conn.rollback()
+                conn.close()
+                return (
+                    jsonify(
+                        {
+                            "success": False,
+                            "error": f"Database cleanup failed: {str(e)}",
+                        }
+                    ),
+                    500,
+                )
+
+            app.logger.info("═══════════════════════════════════════")
+            app.logger.info(f"✅ Deletion completed for {site_name}")
+            app.logger.info("═══════════════════════════════════════")
+
+            return jsonify(
+                {
+                    "success": True,
+                    "message": f"Site '{site_name}' deleted successfully",
+                    "site_name": site_name,
+                    "removed": {
+                        "pm2": True,
+                        "nginx": bool(domain_name),
+                        "files": True,
+                        "database": True,
+                    },
+                }
+            )
+
+        except Exception as e:
+            app.logger.error(f"Error deleting site {site_name}: {e}")
             return jsonify({"success": False, "error": str(e)}), 500
