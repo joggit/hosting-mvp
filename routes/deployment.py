@@ -96,46 +96,32 @@ def register_routes(app):
             # ═══════════════════════════════════════════════════════════
             # STEP 2: Process domain configuration
             # ═══════════════════════════════════════════════════════════
-            full_domain = None
-            deployment_type = "simple"
+            domain = None
 
             if domain_config:
-                if domain_config.get("subdomain") and domain_config.get(
-                    "parent_domain"
-                ):
-                    subdomain = domain_config["subdomain"].lower().strip()
-                    parent_domain = domain_config["parent_domain"]
-                    full_domain = f"{subdomain}.{parent_domain}"
-                    deployment_type = "subdomain"
-                    app.logger.info(f"Subdomain deployment: {full_domain}")
+                # Get domain directly
+                domain = domain_config.get("domain") or domain_config.get("root_domain")
 
-                elif domain_config.get("root_domain"):
-                    full_domain = domain_config["root_domain"]
-                    deployment_type = "root"
-                    app.logger.info(f"Root domain deployment: {full_domain}")
+                if domain:
+                    domain = domain.lower().strip()
+                    app.logger.info(f"🌐 Domain deployment: {domain}")
 
-                # Check if domain already exists
-                if full_domain:
-                    app.logger.info(
-                        f"Checking if domain {full_domain} exists in database..."
-                    )
+                    # Check if domain already exists
                     conn = get_db()
                     cursor = conn.cursor()
                     cursor.execute(
                         "SELECT COUNT(*) FROM domains WHERE domain_name = ?",
-                        (full_domain,),
+                        (domain,),
                     )
                     exists = cursor.fetchone()[0] > 0
                     conn.close()
 
-                    app.logger.info(f"Domain exists check: {exists}")
-
                     if exists:
-                        error_msg = f"Domain {full_domain} already exists. Please delete it first or use a different name."
+                        error_msg = f"Domain {domain} already exists. Please delete it first or use a different name."
                         app.logger.error(f"❌ {error_msg}")
                         return jsonify({"success": False, "error": error_msg}), 400
 
-                    app.logger.info(f"✅ Domain {full_domain} is available")
+                    app.logger.info(f"✅ Domain {domain} is available")
 
             # ═══════════════════════════════════════════════════════════
             # STEP 3: Fix package.json for Next.js + PM2 compatibility
@@ -304,9 +290,7 @@ module.exports = nextConfig;"""
                             ),
                             500,
                         )
-
                     app.logger.info("✅ npm install completed")
-
                     # Run build if build script exists
                     try:
                         package_data = json.loads(
@@ -347,7 +331,6 @@ module.exports = nextConfig;"""
                         ),
                         500,
                     )
-
             # ═══════════════════════════════════════════════════════════
             # STEP 7: Start the application (PM2 or simple process)
             # ═══════════════════════════════════════════════════════════
@@ -418,39 +401,36 @@ module.exports = nextConfig;"""
                     stderr=subprocess.DEVNULL,
                 )
                 app.logger.info("✅ Started as background process")
-
             # ═══════════════════════════════════════════════════════════
             # STEP 8: Create nginx configuration (if domain provided)
             # ═══════════════════════════════════════════════════════════
-            if full_domain:
-                app.logger.info(f"Creating nginx config for {full_domain}")
+            if domain:
+                app.logger.info(f"🌐 Creating nginx config for {domain}")
 
-                # Create nginx config
                 nginx_config = f"""server {{
-    listen 80;
-    server_name {full_domain} www.{full_domain};
-    
-    location / {{
-        proxy_pass http://localhost:{allocated_port};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_cache_bypass $http_upgrade;
-        
-        # Timeouts
-        proxy_connect_timeout 60s;
-        proxy_send_timeout 60s;
-        proxy_read_timeout 60s;
-    }}
-}}"""
+                listen 80;
+                server_name {domain} www.{domain};
+                
+                location / {{
+                    proxy_pass http://localhost:{allocated_port};
+                    proxy_http_version 1.1;
+                    proxy_set_header Upgrade $http_upgrade;
+                    proxy_set_header Connection 'upgrade';
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $scheme;
+                    proxy_cache_bypass $http_upgrade;
+                    
+                    # Timeouts
+                    proxy_connect_timeout 60s;
+                    proxy_send_timeout 60s;
+                    proxy_read_timeout 60s;
+                }}
+            }}"""
 
                 try:
-                    nginx_path = f"/etc/nginx/sites-available/{full_domain}"
-                    app.logger.info(f"Writing nginx config to: {nginx_path}")
+                    nginx_path = f"/etc/nginx/sites-available/{domain}"
 
                     # Write config using sudo
                     with open("/tmp/nginx_config.tmp", "w") as f:
@@ -462,22 +442,13 @@ module.exports = nextConfig;"""
                     os.remove("/tmp/nginx_config.tmp")
 
                     # Enable site
-                    enabled_path = f"/etc/nginx/sites-enabled/{full_domain}"
+                    enabled_path = f"/etc/nginx/sites-enabled/{domain}"
                     subprocess.run(["sudo", "rm", "-f", enabled_path], check=False)
                     subprocess.run(
                         ["sudo", "ln", "-sf", nginx_path, enabled_path], check=True
                     )
 
-                    app.logger.info("Nginx config created and enabled")
-
-                    # Disable default site if it exists
-                    subprocess.run(
-                        ["sudo", "rm", "-f", "/etc/nginx/sites-enabled/default"],
-                        check=False,
-                    )
-                    app.logger.info("Disabled default nginx site")
-
-                    # Test nginx config
+                    # Test and reload nginx
                     test_result = subprocess.run(
                         ["sudo", "nginx", "-t"], capture_output=True, text=True
                     )
@@ -492,9 +463,6 @@ module.exports = nextConfig;"""
 
                 except Exception as nginx_error:
                     app.logger.error(f"Could not configure nginx: {nginx_error}")
-                    import traceback
-
-                    traceback.print_exc()
 
             # ═══════════════════════════════════════════════════════════
             # STEP 9: Save to database
@@ -503,10 +471,10 @@ module.exports = nextConfig;"""
             cursor = conn.cursor()
 
             # Save domain (without port - it's tracked in processes)
-            if full_domain:
+            if domain:
                 # Check if domain already exists
                 cursor.execute(
-                    "SELECT id FROM domains WHERE domain_name = ?", (full_domain,)
+                    "SELECT id FROM domains WHERE domain_name = ?", (domain,)
                 )
                 existing = cursor.fetchone()
 
@@ -518,7 +486,7 @@ module.exports = nextConfig;"""
                         SET app_name = ?, ssl_enabled = ?, status = 'active'
                         WHERE domain_name = ?
                         """,
-                        (site_name, False, full_domain),
+                        (site_name, False, domain),
                     )
                 else:
                     # Insert new domain (without port column)
@@ -527,7 +495,7 @@ module.exports = nextConfig;"""
                         INSERT INTO domains (domain_name, app_name, ssl_enabled, status)
                         VALUES (?, ?, ?, 'active')
                         """,
-                        (full_domain, site_name, False),
+                        (domain, site_name, False),
                     )
 
             # Save process
@@ -554,16 +522,14 @@ module.exports = nextConfig;"""
                     """,
                     (site_name, allocated_port),
                 )
-
             # Log deployment
             cursor.execute(
                 """
                 INSERT INTO deployment_logs (domain_name, action, status, message)
                 VALUES (?, 'deploy', 'success', ?)
                 """,
-                (full_domain or site_name, f"Deployed {deployment_type} application"),
+                (domain or site_name, f"Deployed application"),
             )
-
             conn.commit()
             conn.close()
 
@@ -581,19 +547,12 @@ module.exports = nextConfig;"""
                 "message": "Deployment successful",
             }
 
-            if full_domain:
+            if domain:
                 response_data["domain"] = {
-                    "full_domain": full_domain,
-                    "domain_type": deployment_type,
-                    "url": f"http://{full_domain}",
+                    "domain": domain,
+                    "url": f"http://{domain}",
                     "ssl_enabled": False,
                 }
-
-                if deployment_type == "subdomain":
-                    response_data["domain"]["subdomain"] = domain_config["subdomain"]
-                    response_data["domain"]["parent_domain"] = domain_config[
-                        "parent_domain"
-                    ]
             else:
                 response_data["url"] = f"http://localhost:{allocated_port}"
 
@@ -601,8 +560,8 @@ module.exports = nextConfig;"""
             app.logger.info(f"✅ Deployment completed successfully")
             app.logger.info(f"Site: {site_name}")
             app.logger.info(f"Port: {allocated_port}")
-            if full_domain:
-                app.logger.info(f"Domain: {full_domain}")
+            if domain:
+                app.logger.info(f"Domain: {domain}")
             app.logger.info(f"═══════════════════════════════════════")
 
             return jsonify(response_data)
