@@ -64,7 +64,7 @@ def register_routes(app):
                 )
 
             site_name = data["name"]
-            project_files = data["_fullFiles"]
+            project_files = data["files"]
             deploy_config = data.get("deployConfig", {})
             domain_config = data.get("domain_config")
 
