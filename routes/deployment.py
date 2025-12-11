@@ -73,6 +73,16 @@ def register_routes(app):
             app.logger.info(f"Has domain_config: {domain_config is not None}")
             app.logger.info(f"Files count: {len(project_files)}")
             app.logger.info(f"═══════════════════════════════════════")
+            # START OF DEBUGGING CODE
+            app.logger.info(f"📋 Files received from frontend:")
+            for file_path in sorted(project_files.keys()):
+                file_size = (
+                    len(project_files[file_path])
+                    if isinstance(project_files[file_path], str)
+                    else 0
+                )
+                app.logger.info(f"   - {file_path} ({file_size} bytes)")
+            # END OF DEBUGGING CODE
 
             # Validate app name (allow dots for domain names)
             app.logger.info(f"Validating site name: '{site_name}'")
