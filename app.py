@@ -22,6 +22,9 @@ from utils.logger import setup_logger
 logger = setup_logger(__name__)
 app = Flask(__name__)
 CORS(app)
+# Flask by default truncates,files from fronted deployer to backend nodejs POST
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100MB
+
 
 # ═══════════════════════════════════════════════════════════
 # Initialize Core Services
@@ -89,22 +92,6 @@ def nginx_command():
 # ═══════════════════════════════════════════════════════════
 
 
-def check_docker_available():
-    """Check if Docker is available for WordPress deployments"""
-    import shutil
-
-    docker_available = shutil.which("docker") is not None
-    docker_compose_available = shutil.which("docker-compose") is not None
-
-    if docker_available and docker_compose_available:
-        logger.info("✅ Docker & Docker Compose available (WordPress enabled)")
-        return True
-    else:
-        logger.warning("⚠️  Docker not found (WordPress disabled)")
-        logger.warning("   Install: sudo apt install docker.io docker-compose")
-        return False
-
-
 # ═══════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════
@@ -117,9 +104,6 @@ if __name__ == "__main__":
     logger.info(f"Web Root: {CONFIG['web_root']}")
     logger.info(f"WordPress Sites: {WORDPRESS_BASE_DIR}")
     logger.info("=" * 60)
-
-    # Check Docker availability
-    check_docker_available()
 
     # Show all registered routes
     show_routes()
