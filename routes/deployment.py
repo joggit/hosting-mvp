@@ -64,7 +64,7 @@ def register_routes(app):
                 )
 
             site_name = data["name"]
-            project_files = data["files"]
+            project_files = data["_fullFiles"]
             deploy_config = data.get("deployConfig", {})
             domain_config = data.get("domain_config")
 
@@ -97,15 +97,12 @@ def register_routes(app):
             # STEP 2: Process domain configuration
             # ═══════════════════════════════════════════════════════════
             domain = None
-
             if domain_config:
                 # Get domain directly
-                domain = domain_config.get("domain") or domain_config.get("root_domain")
-
+                domain = domain_config.get("domain")
                 if domain:
                     domain = domain.lower().strip()
                     app.logger.info(f"🌐 Domain deployment: {domain}")
-
                     # Check if domain already exists
                     conn = get_db()
                     cursor = conn.cursor()
