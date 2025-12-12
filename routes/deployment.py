@@ -140,11 +140,11 @@ def register_routes(app):
                     fixes_applied = []
 
                     # Remove "type": "module" for PM2 compatibility
-                    if package_data.get("type") == "module":
-                        del package_data["type"]
-                        fixes_applied.append(
-                            "Removed 'type: module' for PM2 compatibility"
-                        )
+                    # if package_data.get("type") == "module":
+                    # del package_data["type"]
+                    # fixes_applied.append(
+                    #    "Removed 'type: module' for PM2 compatibility - commenting out for now"
+                    # )
 
                     # Ensure proper scripts exist
                     if "scripts" not in package_data:
@@ -230,9 +230,7 @@ module.exports = nextConfig;"""
             # STEP 5: Create app directory and write files
             # ═══════════════════════════════════════════════════════════
             app_dir = f"{CONFIG['web_root']}/{domain}"
-
             app.logger.info(f"Checking app directory: {app_dir}")
-
             if os.path.exists(app_dir):
                 app.logger.warning(f"⚠️  Directory exists, cleaning up: {app_dir}")
                 try:
