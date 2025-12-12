@@ -229,7 +229,7 @@ module.exports = nextConfig;"""
             # ═══════════════════════════════════════════════════════════
             # STEP 5: Create app directory and write files
             # ═══════════════════════════════════════════════════════════
-            app_dir = f"{CONFIG['web_root']}/{site_name}"
+            app_dir = f"{CONFIG['web_root']}/{domain}"
 
             app.logger.info(f"Checking app directory: {app_dir}")
 
