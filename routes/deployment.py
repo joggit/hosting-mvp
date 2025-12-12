@@ -314,11 +314,27 @@ module.exports = nextConfig;"""
                                 text=True,
                                 timeout=900,  # 15 minutes
                             )
-
                             if build_result.returncode == 0:
                                 app.logger.info("✅ Build completed")
                             else:
-                                app.logger.warning(f"Build completed with warnings")
+                                app.logger.error("❌ Build failed")
+                                app.logger.error(build_result.stdout)
+                                app.logger.error(build_result.stderr)
+                                shutil.rmtree(app_dir, ignore_errors=True)
+                                return (
+                                    jsonify(
+                                        {
+                                            "success": False,
+                                            "error": "Build failed",
+                                            "stdout": build_result.stdout[
+                                                -4000:
+                                            ],  # prevent huge payloads
+                                            "stderr": build_result.stderr[-4000:],
+                                        }
+                                    ),
+                                    500,
+                                )
+
                     except subprocess.TimeoutExpired:
                         app.logger.warning("Build timed out, but continuing...")
                     except Exception as build_error:
