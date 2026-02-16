@@ -4,6 +4,7 @@ One compose stack per site; host nginx proxies by domain to the container port.
 """
 
 import os
+import re
 import subprocess
 import logging
 import shutil
