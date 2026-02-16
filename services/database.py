@@ -15,7 +15,7 @@ def init_database():
 
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA busy_timeout=30000")
     cursor = conn.cursor()
 
     cursor.executescript(
@@ -147,8 +147,8 @@ def init_database():
 
 
 def get_db():
-    """Get database connection with WAL mode and timeout"""
+    """Get database connection with WAL mode and timeout (30s wait if locked)"""
     conn = sqlite3.connect(CONFIG["database_path"], timeout=30.0)
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn

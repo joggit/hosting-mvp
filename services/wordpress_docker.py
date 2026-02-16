@@ -7,6 +7,7 @@ import os
 import subprocess
 import logging
 import shutil
+import time
 from pathlib import Path
 
 from services.database import get_db
@@ -160,17 +161,34 @@ def create_site(site_name: str, domain: str, files: dict) -> dict:
     create_nginx_reverse_proxy(domain, port)
     reload_nginx()
 
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO wordpress_docker_sites (site_name, domain, port, site_path, status, db_name, db_user, db_password)
-        VALUES (?, ?, ?, ?, 'running', ?, ?, ?)
-        """,
-        (site_name, domain, port, str(site_dir), db_name, db_user, db_pass),
-    )
-    conn.commit()
-    conn.close()
+    # Insert site record (retry on SQLite "database is locked")
+    conn = None
+    for attempt in range(5):
+        try:
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO wordpress_docker_sites (site_name, domain, port, site_path, status, db_name, db_user, db_password)
+                VALUES (?, ?, ?, ?, 'running', ?, ?, ?)
+                """,
+                (site_name, domain, port, str(site_dir), db_name, db_user, db_pass),
+            )
+            conn.commit()
+            conn.close()
+            conn = None
+            break
+        except Exception as e:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
+            if "locked" in str(e).lower() and attempt < 4:
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            raise
 
     return {
         "port": port,
