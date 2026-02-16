@@ -90,6 +90,7 @@ def _write_compose(site_dir: Path, port: int, db_name: str, db_user: str, db_pas
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - wp_html:/var/www/html:ro
       - ./theme:/var/www/html/wp-content/themes/{THEME_SLUG}:ro
+      - ./plugins:/var/www/html/wp-content/plugins:ro
     depends_on:
       - wordpress
 
@@ -103,6 +104,7 @@ def _write_compose(site_dir: Path, port: int, db_name: str, db_user: str, db_pas
     volumes:
       - wp_html:/var/www/html
       - ./theme:/var/www/html/wp-content/themes/{THEME_SLUG}
+      - ./plugins:/var/www/html/wp-content/plugins
     depends_on:
       db:
         condition: service_healthy
@@ -140,6 +142,8 @@ def create_site(site_name: str, domain: str, files: dict) -> dict:
     site_dir.mkdir(parents=True, exist_ok=True)
     theme_dir = site_dir / "theme"
     theme_dir.mkdir(exist_ok=True)
+    plugins_dir = site_dir / "plugins"
+    plugins_dir.mkdir(exist_ok=True)
 
     for rel_path, content in files.items():
         if not rel_path.strip() or ".." in rel_path:
