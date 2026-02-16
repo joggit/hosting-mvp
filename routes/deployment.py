@@ -680,6 +680,7 @@ module.exports = nextConfig;"""
             files = data.get("files")
             domain_config = data.get("domain_config") or {}
             domain = (domain_config.get("domain") or "").strip().lower()
+            theme_slug = (data.get("theme_slug") or "").strip() or None
 
             if not name or not files:
                 return jsonify({"success": False, "error": "Missing required fields: name and files"}), 400
@@ -703,7 +704,7 @@ module.exports = nextConfig;"""
                 return jsonify({"success": False, "error": f"Domain {domain} already in use"}), 400
             conn.close()
 
-            result = wp_docker_create_site(site_name, domain, files)
+            result = wp_docker_create_site(site_name, domain, files, theme_slug=theme_slug)
 
             conn = get_db()
             cursor = conn.cursor()

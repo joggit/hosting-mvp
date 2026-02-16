@@ -80,7 +80,18 @@ def _generate_password(length=32):
     return "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(length))
 
 
-def _write_compose(site_dir: Path, port: int, db_name: str, db_user: str, db_pass: str):
+def _write_compose(
+    site_dir: Path,
+    port: int,
+    db_name: str,
+    db_user: str,
+    db_pass: str,
+    theme_slug: str = None,
+):
+    slug = (theme_slug or THEME_SLUG).strip() or THEME_SLUG
+    # Safe for compose: no path separators or quotes
+    if "/" in slug or "\\" in slug or '"' in slug or "\n" in slug:
+        slug = THEME_SLUG
     compose = f"""services:
   nginx:
     image: nginx:alpine
@@ -89,7 +100,7 @@ def _write_compose(site_dir: Path, port: int, db_name: str, db_user: str, db_pas
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - wp_html:/var/www/html:ro
-      - ./theme:/var/www/html/wp-content/themes/{THEME_SLUG}:ro
+      - ./theme:/var/www/html/wp-content/themes/{slug}:ro
       - ./plugins:/var/www/html/wp-content/plugins:ro
     depends_on:
       - wordpress
@@ -103,7 +114,7 @@ def _write_compose(site_dir: Path, port: int, db_name: str, db_user: str, db_pas
       WORDPRESS_DB_NAME: {db_name}
     volumes:
       - wp_html:/var/www/html
-      - ./theme:/var/www/html/wp-content/themes/{THEME_SLUG}
+      - ./theme:/var/www/html/wp-content/themes/{slug}
       - ./plugins:/var/www/html/wp-content/plugins
     depends_on:
       db:
@@ -131,10 +142,13 @@ volumes:
     (site_dir / "docker-compose.yml").write_text(compose)
 
 
-def create_site(site_name: str, domain: str, files: dict) -> dict:
+def create_site(
+    site_name: str, domain: str, files: dict, theme_slug: str = None
+) -> dict:
     """
-    Create a WordPress Docker site: write theme files, generate compose, start stack, create nginx.
-    files: dict of path -> content (paths like "theme/style.css").
+    Create a WordPress Docker site: write theme and plugin files, generate compose, start stack, create nginx.
+    files: dict of path -> content (paths like "theme/style.css", "plugins/.../file.php").
+    theme_slug: directory name under wp-content/themes/ (must match dev so DB option template/stylesheet is valid).
     """
     site_dir = WORDPRESS_DOCKER_BASE / site_name
     if site_dir.exists():
@@ -159,7 +173,7 @@ def create_site(site_name: str, domain: str, files: dict) -> dict:
     db_pass = _generate_password()
 
     (site_dir / "nginx.conf").write_text(CONTAINER_NGINX_CONF)
-    _write_compose(site_dir, port, db_name, db_user, db_pass)
+    _write_compose(site_dir, port, db_name, db_user, db_pass, theme_slug=theme_slug)
 
     _run(["docker", "compose", "up", "-d"], cwd=site_dir, timeout=120)
     create_nginx_reverse_proxy(domain, port)
@@ -249,6 +263,46 @@ def _get_site_db_credentials(site_name: str):
     return Path(site_path), db_name, db_user, db_password
 
 
+def _replace_urls_in_dump_safe(content: str, source_url: str, target_url: str) -> str:
+    """
+    Replace source_url with target_url in dump. Updates PHP serialized string lengths so options (e.g. WooCommerce) stay valid.
+    """
+    if not source_url or not target_url or source_url == target_url:
+        return content
+    result = []
+    i = 0
+    while i < len(content):
+        # Look for PHP serialized string s:N:"
+        m = re.search(r"s:(\d+):\"", content[i:])
+        if not m:
+            result.append(content[i:].replace(source_url, target_url))
+            break
+        j = i + m.start()
+        result.append(content[i:j].replace(source_url, target_url))
+        orig_len = int(m.group(1))
+        payload_start = j + m.end()
+        payload_end = payload_start + orig_len
+        if payload_end + 2 > len(content):
+            result.append(content[j:].replace(source_url, target_url))
+            break
+        if content[payload_end : payload_end + 2] != '";':
+            result.append(content[j : payload_end + 2].replace(source_url, target_url))
+            i = payload_end + 2
+            continue
+        payload = content[payload_start:payload_end]
+        after = content[payload_end : payload_end + 2]
+        if source_url in payload:
+            new_payload = payload.replace(source_url, target_url)
+            new_len = len(new_payload)
+            result.append(f's:{new_len}:"')
+            result.append(new_payload)
+        else:
+            result.append(content[j:payload_end])
+        result.append(after)
+        i = payload_end + 2
+    return "".join(result)
+
+
 def import_site_database(
     site_name: str,
     dump_path: Path,
@@ -257,7 +311,7 @@ def import_site_database(
 ) -> None:
     """
     Import a SQL dump into the site's MySQL container.
-    If source_url and target_url are set, replace the former with the latter in the dump before importing.
+    If source_url and target_url are set, replace the former with the latter in the dump (serialized-safe) before importing.
     """
     site_dir, db_name, db_user, db_password = _get_site_db_credentials(site_name)
     dump_path = Path(dump_path)
@@ -267,7 +321,7 @@ def import_site_database(
     import_path = dump_path
     if source_url and target_url and source_url != target_url:
         content = dump_path.read_text(encoding="utf-8", errors="replace")
-        content = content.replace(source_url, target_url)
+        content = _replace_urls_in_dump_safe(content, source_url, target_url)
         import_path = site_dir / ".import_dump.sql"
         import_path.write_text(content, encoding="utf-8", errors="replace")
 
