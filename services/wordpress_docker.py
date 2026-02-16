@@ -267,10 +267,11 @@ def import_site_database(
         import_path = site_dir / ".import_dump.sql"
         import_path.write_text(content, encoding="utf-8", errors="replace")
 
+    # Use -h 127.0.0.1 so mysql client connects via TCP (socket path can differ in container)
     try:
         with open(import_path, "rb") as f:
             r = subprocess.run(
-                ["docker", "compose", "exec", "-T", "db", "mysql", f"-u{db_user}", f"-p{db_password}", db_name],
+                ["docker", "compose", "exec", "-T", "db", "mysql", "-h", "127.0.0.1", f"-u{db_user}", f"-p{db_password}", db_name],
                 cwd=site_dir,
                 stdin=f,
                 capture_output=True,
