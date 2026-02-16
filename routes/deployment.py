@@ -686,9 +686,10 @@ module.exports = nextConfig;"""
             if not domain:
                 return jsonify({"success": False, "error": "Missing domain in domain_config.domain"}), 400
 
-            site_name = name.replace(".", "-").replace(" ", "-")[:64]
+            # One site per domain; site_name must be unique across all WordPress Docker sites
+            site_name = domain.replace(".", "-").replace(" ", "-").replace(":", "-")[:64]
             if not site_name:
-                return jsonify({"success": False, "error": "Invalid name"}), 400
+                return jsonify({"success": False, "error": "Invalid domain"}), 400
 
             conn = get_db()
             cursor = conn.cursor()
