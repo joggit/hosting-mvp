@@ -65,10 +65,12 @@ def _allocate_port():
     for (p,) in cursor.fetchall():
         used.add(p)
     conn.close()
-    for port in find_available_ports(PORT_START, 1):
+    # Get multiple candidates (not bound on host), pick first not already in DB
+    candidates = find_available_ports(PORT_START, 50)
+    for port in candidates:
         if port not in used:
             return port
-    raise RuntimeError(f"No available port in range starting {PORT_START}")
+    raise RuntimeError(f"No available port in range starting {PORT_START} (tried {len(candidates)} ports, all in use or assigned)")
 
 
 def _generate_password(length=32):
@@ -162,10 +164,10 @@ def create_site(site_name: str, domain: str, files: dict) -> dict:
     cursor = conn.cursor()
     cursor.execute(
         """
-        INSERT INTO wordpress_docker_sites (site_name, domain, port, site_path, status)
-        VALUES (?, ?, ?, ?, 'running')
+        INSERT INTO wordpress_docker_sites (site_name, domain, port, site_path, status, db_name, db_user, db_password)
+        VALUES (?, ?, ?, ?, 'running', ?, ?, ?)
         """,
-        (site_name, domain, port, str(site_dir)),
+        (site_name, domain, port, str(site_dir), db_name, db_user, db_pass),
     )
     conn.commit()
     conn.close()
@@ -173,6 +175,7 @@ def create_site(site_name: str, domain: str, files: dict) -> dict:
     return {
         "port": port,
         "site_path": str(site_dir),
+        "site_name": site_name,
         "url": f"http://{domain}",
         "admin_url": f"http://{domain}/wp-admin",
     }
@@ -205,6 +208,66 @@ def delete_site(site_name: str, domain: str = None):
     cursor.execute("DELETE FROM wordpress_docker_sites WHERE site_name = ?", (site_name,))
     conn.commit()
     conn.close()
+
+
+def _get_site_db_credentials(site_name: str):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT site_path, db_name, db_user, db_password FROM wordpress_docker_sites WHERE site_name = ?",
+        (site_name,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row or not row[0]:
+        raise ValueError(f"Site not found: {site_name}")
+    site_path, db_name, db_user, db_password = row
+    if not all((db_name, db_user, db_password)):
+        raise ValueError(f"Site {site_name} has no DB credentials (deploy may predate mirror support)")
+    return Path(site_path), db_name, db_user, db_password
+
+
+def import_site_database(
+    site_name: str,
+    dump_path: Path,
+    source_url: str = None,
+    target_url: str = None,
+) -> None:
+    """
+    Import a SQL dump into the site's MySQL container.
+    If source_url and target_url are set, replace the former with the latter in the dump before importing.
+    """
+    site_dir, db_name, db_user, db_password = _get_site_db_credentials(site_name)
+    dump_path = Path(dump_path)
+    if not dump_path.is_file():
+        raise FileNotFoundError(f"Dump file not found: {dump_path}")
+
+    import_path = dump_path
+    if source_url and target_url and source_url != target_url:
+        content = dump_path.read_text(encoding="utf-8", errors="replace")
+        content = content.replace(source_url, target_url)
+        import_path = site_dir / ".import_dump.sql"
+        import_path.write_text(content, encoding="utf-8", errors="replace")
+
+    try:
+        with open(import_path, "rb") as f:
+            r = subprocess.run(
+                ["docker", "compose", "exec", "-T", "db", "mysql", f"-u{db_user}", f"-p{db_password}", db_name],
+                cwd=site_dir,
+                stdin=f,
+                capture_output=True,
+                text=False,
+                timeout=600,
+            )
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.decode("utf-8", errors="replace") if r.stderr else "Import failed")
+    except Exception:
+        if import_path != dump_path and import_path.exists():
+            import_path.unlink(missing_ok=True)
+        raise
+    if import_path != dump_path and import_path.exists():
+        import_path.unlink(missing_ok=True)
+    logger.info("Database import completed for %s", site_name)
 
 
 def list_sites():

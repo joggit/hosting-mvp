@@ -10,7 +10,12 @@ import json
 from pathlib import Path
 from services.database import get_db
 from services.port_checker import find_available_ports
-from services.wordpress_docker import create_site as wp_docker_create_site, list_sites as wp_docker_list_sites, delete_site as wp_docker_delete_site
+from services.wordpress_docker import (
+    create_site as wp_docker_create_site,
+    list_sites as wp_docker_list_sites,
+    delete_site as wp_docker_delete_site,
+    import_site_database as wp_docker_import_db,
+)
 from config.settings import CONFIG
 from routes.pages import init_pages_table
 from flask import request, jsonify
@@ -715,6 +720,7 @@ module.exports = nextConfig;"""
             return jsonify({
                 "success": True,
                 "message": "WordPress deployed successfully",
+                "site_name": result.get("site_name", site_name),
                 "url": result["url"],
                 "domain": result["url"],
                 "port": result["port"],
@@ -762,6 +768,40 @@ module.exports = nextConfig;"""
             return jsonify({"success": True, "message": f"Site {site_name} removed"})
         except Exception as e:
             app.logger.exception("Delete WordPress Docker site failed")
+            return jsonify({"success": False, "error": str(e)}), 500
+
+    # ============================================================
+    # POST: Import database (mirror) for WordPress Docker site
+    # ============================================================
+    @app.route("/api/deploy/wordpress/<site_name>/import", methods=["POST"])
+    def import_wordpress_database(site_name):
+        """Import a SQL dump to mirror a WordPress site. Form: dump=file, source_url=, target_url= (or target_domain=)."""
+        try:
+            if "dump" not in request.files:
+                return jsonify({"success": False, "error": "Missing 'dump' file"}), 400
+            f = request.files["dump"]
+            if not f.filename or not f.filename.lower().endswith(".sql"):
+                return jsonify({"success": False, "error": "Upload a .sql file"}), 400
+            source_url = (request.form.get("source_url") or "").strip() or None
+            target_url = (request.form.get("target_url") or "").strip()
+            target_domain = (request.form.get("target_domain") or "").strip()
+            if not target_url and target_domain:
+                target_url = f"http://{target_domain}"
+            if not target_url:
+                target_url = None
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".sql", delete=False) as tmp:
+                f.save(tmp.name)
+                tmp_path = Path(tmp.name)
+            try:
+                wp_docker_import_db(site_name, tmp_path, source_url=source_url, target_url=target_url)
+            finally:
+                tmp_path.unlink(missing_ok=True)
+            return jsonify({"success": True, "message": "Database imported"})
+        except ValueError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+        except Exception as e:
+            app.logger.exception("WordPress import failed")
             return jsonify({"success": False, "error": str(e)}), 500
 
     # ============================================================

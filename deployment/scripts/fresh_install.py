@@ -361,12 +361,33 @@ chmod 775 /etc/nginx/sites-available
 chmod 775 /etc/nginx/sites-enabled
 chmod 775 /etc/php/8.3/fpm/pool.d
 
+mkdir -p /var/lib/hosting-manager/wordpress-docker
+chown {self.username}:{self.username} /var/lib/hosting-manager/wordpress-docker
+
 echo "✅ Directory structure created"
 
 # ═══════════════════════════════════════════════════════════
-# STEP 12: Deploy Application
+# STEP 12: Install Docker + Docker Compose (for WordPress containers)
 # ═══════════════════════════════════════════════════════════
-echo "[12/12] Deploying application..."
+echo "[12/13] Installing Docker and Docker Compose..."
+apt-get install -y ca-certificates curl
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+apt-get update -qq
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+usermod -aG docker {self.username}
+systemctl enable docker
+systemctl start docker
+echo "Docker: $(docker --version)"
+echo "Compose: $(docker compose version 2>/dev/null || echo 'plugin')"
+echo "✅ Docker and Docker Compose installed"
+
+# ═══════════════════════════════════════════════════════════
+# STEP 13: Deploy Application
+# ═══════════════════════════════════════════════════════════
+echo "[13/13] Deploying application..."
 
 mkdir -p /opt/hosting-manager
 chown {self.username}:{self.username} /opt/hosting-manager

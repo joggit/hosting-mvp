@@ -122,12 +122,20 @@ def init_database():
             port INTEGER,
             site_path TEXT,
             status TEXT DEFAULT 'running',
+            db_name TEXT,
+            db_user TEXT,
+            db_password TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         CREATE INDEX IF NOT EXISTS idx_wp_docker_domain ON wordpress_docker_sites(domain);
     """
     )
-
+    # Add columns for mirror/import if table already existed without them
+    for col in ("db_name", "db_user", "db_password"):
+        try:
+            cursor.execute(f"ALTER TABLE wordpress_docker_sites ADD COLUMN {col} TEXT")
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     conn.close()
 
