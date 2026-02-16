@@ -113,6 +113,18 @@ def init_database():
         CREATE INDEX IF NOT EXISTS idx_wp_plugins_site ON wordpress_plugins(site_id);
         CREATE INDEX IF NOT EXISTS idx_wp_themes_site ON wordpress_themes(site_id);
         CREATE INDEX IF NOT EXISTS idx_wp_cli_history_site ON wordpress_cli_history(site_id);
+
+        -- WordPress Docker (container per site, same host as Next.js)
+        CREATE TABLE IF NOT EXISTS wordpress_docker_sites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            site_name TEXT NOT NULL UNIQUE,
+            domain TEXT NOT NULL,
+            port INTEGER,
+            site_path TEXT,
+            status TEXT DEFAULT 'running',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_wp_docker_domain ON wordpress_docker_sites(domain);
     """
     )
 

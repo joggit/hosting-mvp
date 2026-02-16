@@ -3,7 +3,6 @@ Deployment endpoints - Enhanced version
 Handles Node.js/Next.js deployment with domain configuration
 """
 
-from flask import request, jsonify
 import os
 import subprocess
 import shutil
@@ -11,11 +10,61 @@ import json
 from pathlib import Path
 from services.database import get_db
 from services.port_checker import find_available_ports
+from services.wordpress_docker import create_site as wp_docker_create_site, list_sites as wp_docker_list_sites, delete_site as wp_docker_delete_site
 from config.settings import CONFIG
+from routes.pages import init_pages_table
+from flask import request, jsonify
 
 
 def register_routes(app):
     """Register deployment-related routes"""
+
+    def create_deployment_pages(domain, selected_pages, site_name, app):
+        """Create pages during deployment"""
+        if not selected_pages or not domain:
+            return
+
+        app.logger.info(f"📄 Creating {len(selected_pages)} pages for {domain}")
+        init_pages_table()
+
+        conn = get_db()
+        cursor = conn.cursor()
+
+        try:
+            for page in selected_pages:
+                cursor.execute(
+                    "SELECT id FROM pages WHERE site_id = ? AND slug = ?",
+                    (domain, page.get("slug")),
+                )
+                if cursor.fetchone():
+                    continue
+
+                cursor.execute(
+                    """
+                    INSERT INTO pages (
+                        site_id, page_name, slug, template_id, sections, 
+                        metadata, published
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                    (
+                        domain,
+                        page.get("pageName"),
+                        page.get("slug"),
+                        page.get("templateId"),
+                        json.dumps({}),
+                        json.dumps({"title": f"{page.get('pageName')} - {site_name}"}),
+                        page.get("published", True),
+                    ),
+                )
+
+                app.logger.info(f"  ✅ {page.get('pageName')} ({page.get('slug')})")
+
+            conn.commit()
+        except Exception as e:
+            app.logger.error(f"Error creating pages: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
 
     @app.route("/api/deploy/nodejs", methods=["POST"])
     def deploy_nodejs():
@@ -431,6 +480,15 @@ module.exports = nextConfig;"""
                 nginx_config = f"""server {{
                 listen 80;
                 server_name {domain} www.{domain};
+                # Allow for localhost:5000 calls instead of public ip address   
+                location /api/ {{
+                    proxy_pass http://127.0.0.1:5000;
+                    proxy_http_version 1.1;
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $scheme;
+                }}
                 
                 location / {{
                     proxy_pass http://localhost:{allocated_port};
@@ -468,12 +526,10 @@ module.exports = nextConfig;"""
                     subprocess.run(
                         ["sudo", "ln", "-sf", nginx_path, enabled_path], check=True
                     )
-
                     # Test and reload nginx
                     test_result = subprocess.run(
                         ["sudo", "nginx", "-t"], capture_output=True, text=True
                     )
-
                     if test_result.returncode == 0:
                         subprocess.run(["sudo", "systemctl", "reload", "nginx"])
                         app.logger.info("✅ Nginx configured and reloaded")
@@ -556,6 +612,11 @@ module.exports = nextConfig;"""
 
             app.logger.info("✅ Database updated")
 
+            # Create pages from selection
+            selected_pages = data.get("selectedPages", [])
+            if selected_pages and domain:
+                create_deployment_pages(domain, selected_pages, site_name, app)
+
             # ═══════════════════════════════════════════════════════════
             # STEP 10: Build response
             # ═══════════════════════════════════════════════════════════
@@ -592,6 +653,115 @@ module.exports = nextConfig;"""
             import traceback
 
             traceback.print_exc()
+            return jsonify({"success": False, "error": str(e)}), 500
+
+    # ============================================================
+    # POST: Deploy WordPress (Docker container, same host nginx)
+    # ============================================================
+    @app.route("/api/deploy/wordpress", methods=["POST"])
+    def deploy_wordpress():
+        """Deploy a WordPress theme to a new Docker stack; nginx on host proxies by domain."""
+        try:
+            if not request.is_json:
+                return jsonify({"success": False, "error": "Content-Type must be application/json"}), 400
+            try:
+                data = request.get_json(force=True)
+            except Exception as e:
+                return jsonify({"success": False, "error": f"Invalid JSON: {str(e)}"}), 400
+            if not data:
+                return jsonify({"success": False, "error": "Request body is empty"}), 400
+
+            name = data.get("name")
+            files = data.get("files")
+            domain_config = data.get("domain_config") or {}
+            domain = (domain_config.get("domain") or "").strip().lower()
+
+            if not name or not files:
+                return jsonify({"success": False, "error": "Missing required fields: name and files"}), 400
+            if not domain:
+                return jsonify({"success": False, "error": "Missing domain in domain_config.domain"}), 400
+
+            site_name = name.replace(".", "-").replace(" ", "-")[:64]
+            if not site_name:
+                return jsonify({"success": False, "error": "Invalid name"}), 400
+
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM domains WHERE domain_name = ?", (domain,))
+            if cursor.fetchone():
+                conn.close()
+                return jsonify({"success": False, "error": f"Domain {domain} already in use"}), 400
+            cursor.execute("SELECT 1 FROM wordpress_docker_sites WHERE domain = ?", (domain,))
+            if cursor.fetchone():
+                conn.close()
+                return jsonify({"success": False, "error": f"Domain {domain} already in use"}), 400
+            conn.close()
+
+            result = wp_docker_create_site(site_name, domain, files)
+
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO domains (domain_name, port, app_name, status) VALUES (?, ?, ?, 'active')",
+                (domain, result["port"], site_name),
+            )
+            cursor.execute(
+                "INSERT INTO deployment_logs (domain_name, action, status, message) VALUES (?, 'wordpress_docker_deploy', 'success', ?)",
+                (domain, f"WordPress Docker deployed: {site_name}"),
+            )
+            conn.commit()
+            conn.close()
+
+            return jsonify({
+                "success": True,
+                "message": "WordPress deployed successfully",
+                "url": result["url"],
+                "domain": result["url"],
+                "port": result["port"],
+                "admin_url": result["admin_url"],
+            })
+        except Exception as e:
+            app.logger.exception("WordPress Docker deploy failed")
+            return jsonify({"success": False, "error": str(e)}), 500
+
+    # ============================================================
+    # GET: List WordPress Docker sites
+    # ============================================================
+    @app.route("/api/deploy/wordpress", methods=["GET"])
+    def list_wordpress_docker_sites():
+        """List WordPress sites deployed as Docker containers."""
+        try:
+            sites = wp_docker_list_sites()
+            return jsonify({"success": True, "sites": sites})
+        except Exception as e:
+            app.logger.error("List WordPress Docker sites: %s", e)
+            return jsonify({"success": False, "error": str(e)}), 500
+
+    @app.route("/api/deploy/wordpress/<site_name>", methods=["DELETE"])
+    def delete_wordpress_docker_site(site_name):
+        """Remove a WordPress Docker site (containers, nginx, files, DB entry)."""
+        try:
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute("SELECT domain FROM wordpress_docker_sites WHERE site_name = ?", (site_name,))
+            row = cursor.fetchone()
+            conn.close()
+            if not row:
+                return jsonify({"success": False, "error": "Site not found"}), 404
+            domain = row[0]
+            wp_docker_delete_site(site_name, domain)
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM domains WHERE domain_name = ? AND app_name = ?", (domain, site_name))
+            cursor.execute(
+                "INSERT INTO deployment_logs (domain_name, action, status, message) VALUES (?, 'wordpress_docker_delete', 'success', ?)",
+                (domain, f"WordPress Docker removed: {site_name}"),
+            )
+            conn.commit()
+            conn.close()
+            return jsonify({"success": True, "message": f"Site {site_name} removed"})
+        except Exception as e:
+            app.logger.exception("Delete WordPress Docker site failed")
             return jsonify({"success": False, "error": str(e)}), 500
 
     # ============================================================

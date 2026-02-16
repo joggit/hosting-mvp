@@ -18,6 +18,7 @@ from services.database import init_database
 from routes import register_all_routes
 from utils.logger import setup_logger
 
+
 # Setup
 logger = setup_logger(__name__)
 app = Flask(__name__)
