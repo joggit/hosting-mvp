@@ -59,6 +59,46 @@ def _run(cmd, cwd=None, check=True, capture=True, timeout=300):
     return result
 
 
+def _copy_theme_and_plugins_into_volume(site_dir: Path, theme_slug: str) -> None:
+    """Copy theme and plugins from host into the wp_html volume so the container sees them with correct ownership."""
+    slug = (theme_slug or THEME_SLUG).strip()[:64]
+    if not slug or "/" in slug or "\\" in slug:
+        return
+    theme_src = site_dir / "theme"
+    plugins_src = site_dir / "plugins"
+    if not theme_src.is_dir():
+        return
+    # Compose project name = directory name by default → volume name = {name}_wp_html
+    volume_name = f"{site_dir.name}_wp_html"
+    dest = "/dest"
+    try:
+        # Use alpine to copy into the volume (no bind-mount override); www-data uid:gid = 33:33
+        cmd = [
+            "docker", "run", "--rm",
+            "-v", f"{theme_src.resolve()}:/.src_theme:ro",
+            "-v", f"{volume_name}:{dest}",
+            "alpine",
+            "sh", "-c",
+            f"cp -r /.src_theme {dest}/wp-content/themes/{slug} && chown -R 33:33 {dest}/wp-content/themes/{slug}",
+        ]
+        subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=True)
+        if plugins_src.is_dir():
+            cmd_plugins = [
+                "docker", "run", "--rm",
+                "-v", f"{plugins_src.resolve()}:/.src_plugins:ro",
+                "-v", f"{volume_name}:{dest}",
+                "alpine",
+                "sh", "-c",
+                f"cp -r /.src_plugins/. {dest}/wp-content/plugins/ 2>/dev/null || true && chown -R 33:33 {dest}/wp-content/plugins",
+            ]
+            subprocess.run(cmd_plugins, capture_output=True, text=True, timeout=300, check=False)
+        logger.info("Copied theme (and plugins) into volume for %s", slug)
+    except subprocess.CalledProcessError as e:
+        logger.warning("Copy theme/plugins into volume failed (non-fatal): %s", e.stderr or e.stdout)
+    except Exception as e:
+        logger.warning("Copy theme/plugins into volume failed (non-fatal): %s", e)
+
+
 def _allocate_port():
     used = set()
     conn = get_db()
@@ -93,6 +133,7 @@ def _write_compose(
     # Safe for compose: no path separators or quotes
     if "/" in slug or "\\" in slug or '"' in slug or "\n" in slug:
         slug = THEME_SLUG
+    # Theme/plugins are copied into wp_html volume after compose up (no bind mounts)
     compose = f"""services:
   nginx:
     image: nginx:alpine
@@ -101,8 +142,6 @@ def _write_compose(
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - wp_html:/var/www/html:ro
-      - ./theme:/var/www/html/wp-content/themes/{slug}:ro
-      - ./plugins:/var/www/html/wp-content/plugins:ro
     depends_on:
       - wordpress
 
@@ -115,8 +154,6 @@ def _write_compose(
       WORDPRESS_DB_NAME: {db_name}
     volumes:
       - wp_html:/var/www/html
-      - ./theme:/var/www/html/wp-content/themes/{slug}
-      - ./plugins:/var/www/html/wp-content/plugins
     depends_on:
       db:
         condition: service_healthy
@@ -180,6 +217,8 @@ def create_site(
     _write_compose(site_dir, port, db_name, db_user, db_pass, theme_slug=theme_slug)
 
     _run(["docker", "compose", "up", "-d"], cwd=site_dir, timeout=120)
+    # Copy theme and plugins into the container volume so they exist with correct ownership (not only bind mount)
+    _copy_theme_and_plugins_into_volume(site_dir, resolved_slug)
     create_nginx_reverse_proxy(domain, port)
     reload_nginx()
 
@@ -390,12 +429,44 @@ def import_site_database(
     # Mark WooCommerce setup wizard as completed so mirror deploy doesn't show "setup store" again
     _mark_woocommerce_wizard_completed(site_dir, db_name, db_user, db_password)
 
-    # Force active theme to what we mounted so the mirrored theme is always selected (template + stylesheet)
+    # Force active theme: SQL update first, then WordPress API via PHP script (reliable inside container)
     if active_theme_slug:
         _set_active_theme(site_dir, db_name, db_user, db_password, active_theme_slug)
+        _activate_theme_via_php(site_dir, active_theme_slug)
         logger.info("Set active theme to %s for %s", active_theme_slug, site_name)
 
     logger.info("Database import completed for %s", site_name)
+
+
+def _activate_theme_via_php(site_dir: Path, theme_slug: str) -> None:
+    """Run the theme's activate_theme.php inside the wordpress container so switch_theme() is used."""
+    slug = (theme_slug or "").strip()[:64]
+    if not slug or "/" in slug or "\\" in slug:
+        return
+    script_path = f"/var/www/html/wp-content/themes/{slug}/activate_theme.php"
+    try:
+        r = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "exec",
+                "-T",
+                "wordpress",
+                "php",
+                script_path,
+            ],
+            cwd=site_dir,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if r.returncode != 0:
+            logger.warning(
+                "Theme PHP activation failed (non-fatal): %s",
+                r.stderr or r.stdout or "exit %s" % r.returncode,
+            )
+    except Exception as e:
+        logger.warning("Theme PHP activation failed (non-fatal): %s", e)
 
 
 def _set_active_theme(
