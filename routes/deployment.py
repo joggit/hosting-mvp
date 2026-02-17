@@ -787,6 +787,7 @@ module.exports = nextConfig;"""
             source_url = (request.form.get("source_url") or "").strip() or None
             target_url = (request.form.get("target_url") or "").strip()
             target_domain = (request.form.get("target_domain") or "").strip()
+            theme_slug = (request.form.get("theme_slug") or "").strip() or None
             if not target_url and target_domain:
                 target_url = f"http://{target_domain}"
             if not target_url:
@@ -796,7 +797,13 @@ module.exports = nextConfig;"""
                 f.save(tmp.name)
                 tmp_path = Path(tmp.name)
             try:
-                wp_docker_import_db(site_name, tmp_path, source_url=source_url, target_url=target_url)
+                wp_docker_import_db(
+                    site_name,
+                    tmp_path,
+                    source_url=source_url,
+                    target_url=target_url,
+                    theme_slug=theme_slug,
+                )
             finally:
                 tmp_path.unlink(missing_ok=True)
             return jsonify({"success": True, "message": "Database imported"})

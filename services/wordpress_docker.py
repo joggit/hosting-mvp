@@ -309,10 +309,12 @@ def import_site_database(
     dump_path: Path,
     source_url: str = None,
     target_url: str = None,
+    theme_slug: str = None,
 ) -> None:
     """
     Import a SQL dump into the site's MySQL container.
     If source_url and target_url are set, replace the former with the latter in the dump (serialized-safe) before importing.
+    If theme_slug is set, after import the active theme (template + stylesheet) is set to that slug so the mirrored theme is selected.
     """
     site_dir, db_name, db_user, db_password = _get_site_db_credentials(site_name)
     dump_path = Path(dump_path)
@@ -345,7 +347,100 @@ def import_site_database(
         raise
     if import_path != dump_path and import_path.exists():
         import_path.unlink(missing_ok=True)
+
+    # Mark WooCommerce setup wizard as completed so mirror deploy doesn't show "setup store" again
+    _mark_woocommerce_wizard_completed(site_dir, db_name, db_user, db_password)
+
+    # Force active theme so the mirrored theme is selected (template + stylesheet)
+    if theme_slug:
+        _set_active_theme(site_dir, db_name, db_user, db_password, theme_slug)
+
     logger.info("Database import completed for %s", site_name)
+
+
+def _set_active_theme(
+    site_dir: Path,
+    db_name: str,
+    db_user: str,
+    db_password: str,
+    theme_slug: str,
+    table_prefix: str = "wp_",
+) -> None:
+    """Set WordPress active theme (template and stylesheet options) so the mirrored theme is selected."""
+    slug = theme_slug.strip()[:64]
+    if not slug or "/" in slug or "\\" in slug or "'" in slug:
+        return
+    try:
+        for option_name in ("template", "stylesheet"):
+            r = subprocess.run(
+                [
+                    "docker",
+                    "compose",
+                    "exec",
+                    "-T",
+                    "db",
+                    "mysql",
+                    "-h",
+                    "127.0.0.1",
+                    f"-u{db_user}",
+                    f"-p{db_password}",
+                    db_name,
+                    "-e",
+                    f"UPDATE {table_prefix}options SET option_value = '{slug}' "
+                    f"WHERE option_name = '{option_name}';",
+                ],
+                cwd=site_dir,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if r.returncode != 0:
+                logger.warning(
+                    "Could not set option %s (non-fatal): %s",
+                    option_name,
+                    r.stderr or r.stdout,
+                )
+    except Exception as e:
+        logger.warning("Could not set active theme (non-fatal): %s", e)
+
+
+def _mark_woocommerce_wizard_completed(
+    site_dir: Path, db_name: str, db_user: str, db_password: str, table_prefix: str = "wp_"
+) -> None:
+    """Set woocommerce_onboarding_profile so the setup wizard is skipped (mirror = already set up)."""
+    # WordPress stores options as PHP-serialized; completed + skipped so wizard doesn't show
+    value = "a:2:{s:9:\"completed\";b:1;s:7:\"skipped\";b:1;}"
+    try:
+        r = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "exec",
+                "-T",
+                "db",
+                "mysql",
+                "-h",
+                "127.0.0.1",
+                f"-u{db_user}",
+                f"-p{db_password}",
+                db_name,
+                "-e",
+                f"INSERT INTO {table_prefix}options (option_name, option_value, autoload) "
+                f"VALUES ('woocommerce_onboarding_profile', '{value}', 'no') "
+                f"ON DUPLICATE KEY UPDATE option_value = '{value}';",
+            ],
+            cwd=site_dir,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if r.returncode != 0:
+            logger.warning(
+                "Could not set WooCommerce wizard completed (non-fatal): %s",
+                r.stderr or r.stdout,
+            )
+    except Exception as e:
+        logger.warning("Could not set WooCommerce wizard completed (non-fatal): %s", e)
 
 
 def list_sites():
