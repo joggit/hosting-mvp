@@ -352,10 +352,13 @@ def import_site_database(
     If source_url and target_url are set, replace the former with the latter in the dump (serialized-safe) before importing.
     If theme_slug is set, after import the active theme (template + stylesheet) is set to that slug so the mirrored theme is selected.
     """
-    site_dir, db_name, db_user, db_password = _get_site_db_credentials(site_name)
+    site_dir, db_name, db_user, db_password, theme_slug_from_db = _get_site_db_credentials(site_name)
     dump_path = Path(dump_path)
     if not dump_path.is_file():
         raise FileNotFoundError(f"Dump file not found: {dump_path}")
+
+    # Resolve theme slug: client param > stored at create time > read from compose file
+    active_theme_slug = (theme_slug or theme_slug_from_db or _theme_slug_from_compose(site_dir) or "").strip() or None
 
     import_path = dump_path
     if source_url and target_url and source_url != target_url:
