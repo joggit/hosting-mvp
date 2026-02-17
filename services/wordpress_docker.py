@@ -59,44 +59,22 @@ def _run(cmd, cwd=None, check=True, capture=True, timeout=300):
     return result
 
 
-def _copy_theme_and_plugins_into_volume(site_dir: Path, theme_slug: str) -> None:
-    """Copy theme and plugins from host into the wp_html volume so the container sees them with correct ownership."""
-    slug = (theme_slug or THEME_SLUG).strip()[:64]
-    if not slug or "/" in slug or "\\" in slug:
-        return
-    theme_src = site_dir / "theme"
-    plugins_src = site_dir / "plugins"
-    if not theme_src.is_dir():
-        return
-    # Compose project name = directory name by default → volume name = {name}_wp_html
-    volume_name = f"{site_dir.name}_wp_html"
-    dest = "/dest"
-    try:
-        # Use alpine to copy into the volume (no bind-mount override); www-data uid:gid = 33:33
-        cmd = [
-            "docker", "run", "--rm",
-            "-v", f"{theme_src.resolve()}:/.src_theme:ro",
-            "-v", f"{volume_name}:{dest}",
-            "alpine",
-            "sh", "-c",
-            f"cp -r /.src_theme {dest}/wp-content/themes/{slug} && chown -R 33:33 {dest}/wp-content/themes/{slug}",
-        ]
-        subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=True)
-        if plugins_src.is_dir():
-            cmd_plugins = [
-                "docker", "run", "--rm",
-                "-v", f"{plugins_src.resolve()}:/.src_plugins:ro",
-                "-v", f"{volume_name}:{dest}",
-                "alpine",
-                "sh", "-c",
-                f"cp -r /.src_plugins/. {dest}/wp-content/plugins/ 2>/dev/null || true && chown -R 33:33 {dest}/wp-content/plugins",
-            ]
-            subprocess.run(cmd_plugins, capture_output=True, text=True, timeout=300, check=False)
-        logger.info("Copied theme (and plugins) into volume for %s", slug)
-    except subprocess.CalledProcessError as e:
-        logger.warning("Copy theme/plugins into volume failed (non-fatal): %s", e.stderr or e.stdout)
-    except Exception as e:
-        logger.warning("Copy theme/plugins into volume failed (non-fatal): %s", e)
+def _write_dockerfile(site_dir: Path, theme_slug: str) -> None:
+    """Write Dockerfile that bakes theme and plugins into the WordPress image (port the app as a container)."""
+    slug = (theme_slug or THEME_SLUG).strip() or THEME_SLUG
+    if "/" in slug or "\\" in slug or '"' in slug:
+        slug = THEME_SLUG
+    dockerfile = f"""# WordPress app image: theme + plugins baked in (mirror = same app in container)
+FROM wordpress:latest
+ARG THEME_SLUG=wordpress-starter
+COPY theme/ /var/www/html/wp-content/themes/${{THEME_SLUG}}/
+COPY plugins/ /var/www/html/wp-content/plugins/
+RUN chown -R www-data:www-data /var/www/html/wp-content/themes /var/www/html/wp-content/plugins
+"""
+    (site_dir / "Dockerfile").write_text(dockerfile)
+    (site_dir / ".dockerignore").write_text(
+        "docker-compose.yml\n*.sql\n.git\n.deploy-tmp\n"
+    )
 
 
 def _allocate_port():
@@ -128,32 +106,30 @@ def _write_compose(
     db_user: str,
     db_pass: str,
     theme_slug: str = None,
+    site_name: str = None,
 ):
     slug = (theme_slug or THEME_SLUG).strip() or THEME_SLUG
-    # Safe for compose: no path separators or quotes
     if "/" in slug or "\\" in slug or '"' in slug or "\n" in slug:
         slug = THEME_SLUG
-    # Theme/plugins are copied into wp_html volume after compose up (no bind mounts)
+    image_name = f"wordpress-{site_name}:latest" if site_name else "wordpress-app:latest"
+    # App is the image (Dockerfile bakes theme + plugins). WordPress container serves HTTP on 80.
     compose = f"""services:
-  nginx:
-    image: nginx:alpine
+  wordpress:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        THEME_SLUG: {slug}
+    image: {image_name}
     ports:
       - "{port}:80"
-    volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - wp_html:/var/www/html:ro
-    depends_on:
-      - wordpress
-
-  wordpress:
-    image: wordpress:fpm
     environment:
       WORDPRESS_DB_HOST: db
       WORDPRESS_DB_USER: {db_user}
       WORDPRESS_DB_PASSWORD: {db_pass}
       WORDPRESS_DB_NAME: {db_name}
     volumes:
-      - wp_html:/var/www/html
+      - wp_uploads:/var/www/html/wp-content/uploads
     depends_on:
       db:
         condition: service_healthy
@@ -174,7 +150,7 @@ def _write_compose(
       retries: 10
 
 volumes:
-  wp_html:
+  wp_uploads:
   db_data:
 """
     (site_dir / "docker-compose.yml").write_text(compose)
@@ -210,15 +186,18 @@ def create_site(
     db_user = db_name
     db_pass = _generate_password()
 
-    (site_dir / "nginx.conf").write_text(CONTAINER_NGINX_CONF)
     resolved_slug = (theme_slug or THEME_SLUG).strip() or THEME_SLUG
     if "/" in resolved_slug or "\\" in resolved_slug or '"' in resolved_slug or "\n" in resolved_slug:
         resolved_slug = THEME_SLUG
-    _write_compose(site_dir, port, db_name, db_user, db_pass, theme_slug=theme_slug)
+    _write_dockerfile(site_dir, resolved_slug)
+    _write_compose(site_dir, port, db_name, db_user, db_pass, theme_slug=resolved_slug, site_name=site_name)
 
+    _run(
+        ["docker", "compose", "build", "--build-arg", f"THEME_SLUG={resolved_slug}"],
+        cwd=site_dir,
+        timeout=600,
+    )
     _run(["docker", "compose", "up", "-d"], cwd=site_dir, timeout=120)
-    # Copy theme and plugins into the container volume so they exist with correct ownership (not only bind mount)
-    _copy_theme_and_plugins_into_volume(site_dir, resolved_slug)
     create_nginx_reverse_proxy(domain, port)
     reload_nginx()
 
