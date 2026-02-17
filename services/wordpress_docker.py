@@ -174,6 +174,9 @@ def create_site(
     db_pass = _generate_password()
 
     (site_dir / "nginx.conf").write_text(CONTAINER_NGINX_CONF)
+    resolved_slug = (theme_slug or THEME_SLUG).strip() or THEME_SLUG
+    if "/" in resolved_slug or "\\" in resolved_slug or '"' in resolved_slug or "\n" in resolved_slug:
+        resolved_slug = THEME_SLUG
     _write_compose(site_dir, port, db_name, db_user, db_pass, theme_slug=theme_slug)
 
     _run(["docker", "compose", "up", "-d"], cwd=site_dir, timeout=120)
@@ -186,13 +189,25 @@ def create_site(
         try:
             conn = get_db()
             cursor = conn.cursor()
-            cursor.execute(
-                """
-                INSERT INTO wordpress_docker_sites (site_name, domain, port, site_path, status, db_name, db_user, db_password)
-                VALUES (?, ?, ?, ?, 'running', ?, ?, ?)
-                """,
-                (site_name, domain, port, str(site_dir), db_name, db_user, db_pass),
-            )
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO wordpress_docker_sites (site_name, domain, port, site_path, status, db_name, db_user, db_password, theme_slug)
+                    VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?)
+                    """,
+                    (site_name, domain, port, str(site_dir), db_name, db_user, db_pass, resolved_slug),
+                )
+            except Exception as col_err:
+                if "theme_slug" in str(col_err) or "no such column" in str(col_err).lower():
+                    cursor.execute(
+                        """
+                        INSERT INTO wordpress_docker_sites (site_name, domain, port, site_path, status, db_name, db_user, db_password)
+                        VALUES (?, ?, ?, ?, 'running', ?, ?, ?)
+                        """,
+                        (site_name, domain, port, str(site_dir), db_name, db_user, db_pass),
+                    )
+                else:
+                    raise
             conn.commit()
             conn.close()
             conn = None
@@ -250,18 +265,39 @@ def delete_site(site_name: str, domain: str = None):
 def _get_site_db_credentials(site_name: str):
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT site_path, db_name, db_user, db_password FROM wordpress_docker_sites WHERE site_name = ?",
-        (site_name,),
-    )
+    try:
+        cursor.execute(
+            "SELECT site_path, db_name, db_user, db_password, theme_slug FROM wordpress_docker_sites WHERE site_name = ?",
+            (site_name,),
+        )
+    except Exception:
+        cursor.execute(
+            "SELECT site_path, db_name, db_user, db_password FROM wordpress_docker_sites WHERE site_name = ?",
+            (site_name,),
+        )
     row = cursor.fetchone()
     conn.close()
     if not row or not row[0]:
         raise ValueError(f"Site not found: {site_name}")
-    site_path, db_name, db_user, db_password = row
+    site_path, db_name, db_user, db_password = row[0], row[1], row[2], row[3]
+    theme_slug = row[4] if len(row) > 4 and row[4] else None
     if not all((db_name, db_user, db_password)):
         raise ValueError(f"Site {site_name} has no DB credentials (deploy may predate mirror support)")
-    return Path(site_path), db_name, db_user, db_password
+    return Path(site_path), db_name, db_user, db_password, theme_slug
+
+
+def _theme_slug_from_compose(site_dir: Path) -> str:
+    """Read the theme slug from the site's docker-compose.yml (what we actually mounted)."""
+    compose_path = site_dir / "docker-compose.yml"
+    if not compose_path.is_file():
+        return ""
+    try:
+        text = compose_path.read_text(encoding="utf-8")
+        # .../themes/SLUG:ro or .../themes/SLUG\n
+        m = re.search(r"/wp-content/themes/([a-zA-Z0-9_-]+)(?::ro)?\s", text)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
 
 
 def _replace_urls_in_dump_safe(content: str, source_url: str, target_url: str) -> str:
@@ -351,9 +387,10 @@ def import_site_database(
     # Mark WooCommerce setup wizard as completed so mirror deploy doesn't show "setup store" again
     _mark_woocommerce_wizard_completed(site_dir, db_name, db_user, db_password)
 
-    # Force active theme so the mirrored theme is selected (template + stylesheet)
-    if theme_slug:
-        _set_active_theme(site_dir, db_name, db_user, db_password, theme_slug)
+    # Force active theme to what we mounted so the mirrored theme is always selected (template + stylesheet)
+    if active_theme_slug:
+        _set_active_theme(site_dir, db_name, db_user, db_password, active_theme_slug)
+        logger.info("Set active theme to %s for %s", active_theme_slug, site_name)
 
     logger.info("Database import completed for %s", site_name)
 

@@ -131,7 +131,7 @@ def init_database():
     """
     )
     # Add columns for mirror/import if table already existed without them
-    for col in ("db_name", "db_user", "db_password"):
+    for col in ("db_name", "db_user", "db_password", "theme_slug"):
         try:
             cursor.execute(f"ALTER TABLE wordpress_docker_sites ADD COLUMN {col} TEXT")
         except sqlite3.OperationalError:
