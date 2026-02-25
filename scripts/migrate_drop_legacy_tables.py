@@ -44,7 +44,7 @@ LEGACY_TABLES = [
     "wordpress_sites",  # drop parent last
 ]
 
-DEFAULT_DB_PATH = Path("/var/data/hosting.db")
+DEFAULT_DB_PATH = Path("/var/lib/hosting-manager/hosting.db")
 
 
 def find_db(path: Path) -> Path:
