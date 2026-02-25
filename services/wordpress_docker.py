@@ -1,556 +1,703 @@
 """
-WordPress deployment via Docker containers.
-One compose stack per site; host nginx proxies by domain to the container port.
+services/wordpress_docker.py
+
+WordPress Docker lifecycle management for hosting-mvp.
+
+Each WordPress site runs as an isolated Docker Compose stack:
+  - wordpress container  : official WordPress image + WP-CLI
+  - db container         : MySQL 8.0
+
+Nginx on the host proxies the domain to the allocated port.
+
+Lessons learned from wp-devops (applied here):
+  - URL replacement MUST use `wp search-replace` inside the container.
+    Raw string substitution on SQL files corrupts WordPress serialised PHP
+    arrays, causing silent data loss (theme options, logos, widget settings).
+  - Uploads need a persistent named volume so they survive redeployments.
+  - Passwords containing special chars (!&$) must be single-quoted when
+    passed through shell commands.
+  - WP-CLI commands that output PHP (wp option get) should use --format=json
+    to avoid serialisation issues when reading values back.
+  - php -r inline code fails through docker exec due to quote escaping.
+    Always write PHP to a temp file, docker cp it in, then use wp eval-file.
+  - UID 33 (www-data) must own wp-content/uploads inside the container.
 """
 
 import os
-import re
+import json
+import shutil
+import secrets
+import string
 import subprocess
 import logging
-import shutil
-import time
+import tempfile
 from pathlib import Path
-
 from services.database import get_db
 from services.port_checker import find_available_ports
-from services.nginx_config import create_nginx_reverse_proxy, remove_nginx_site, reload_nginx
+from config.settings import CONFIG
 
 logger = logging.getLogger(__name__)
 
-WORDPRESS_DOCKER_BASE = Path(
-    os.getenv("WORDPRESS_DOCKER_BASE", "/var/lib/hosting-manager/wordpress-docker")
-)
-PORT_START = 9080
-THEME_SLUG = "wordpress-starter"
+# ── Constants ─────────────────────────────────────────────────────────────────
 
-# Nginx config for the container (proxy PHP to wordpress:9000)
-CONTAINER_NGINX_CONF = """server {
-    listen 80;
-    server_name _;
-    root /var/www/html;
-    index index.php;
+WORDPRESS_BASE_DIR = Path(CONFIG.get("wordpress_dir", "/var/www/wordpress"))
+NGINX_AVAILABLE = Path("/etc/nginx/sites-available")
+NGINX_ENABLED = Path("/etc/nginx/sites-enabled")
 
-    location / {
-        try_files $uri $uri/ /index.php?$args;
-    }
-
-    location ~ \\.php$ {
-        try_files $uri =404;
-        fastcgi_split_path_info ^(.+\\.php)(/.+)$;
-        fastcgi_pass wordpress:9000;
-        fastcgi_index index.php;
-        include fastcgi_params;
-        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-        fastcgi_param PATH_INFO $fastcgi_path_info;
-        fastcgi_buffers 16 16k;
-        fastcgi_buffer_size 32k;
-    }
-}
-"""
+WORDPRESS_IMAGE = "wordpress:latest"
+MYSQL_IMAGE = "mysql:8.0"
 
 
-def _run(cmd, cwd=None, check=True, capture=True, timeout=300):
-    kwargs = {"capture_output": capture, "text": True, "timeout": timeout}
-    if cwd:
-        kwargs["cwd"] = str(cwd)
-    result = subprocess.run(cmd, **kwargs)
-    if check and result.returncode != 0:
-        raise RuntimeError(result.stderr or result.stdout or f"Exit {result.returncode}")
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _generate_password(length: int = 24) -> str:
+    """Generate a secure random password safe for shell single-quoting.
+    Excludes single quotes to ensure safe use in shell -p'PASSWORD' patterns.
+    """
+    chars = string.ascii_letters + string.digits + "!@#%^&*-_=+."
+    return "".join(secrets.choice(chars) for _ in range(length))
+
+
+def _run(cmd: str, description: str, check: bool = True) -> subprocess.CompletedProcess:
+    """Run a shell command, log it, and raise on failure if check=True."""
+    logger.info(f"  ▶  {description}")
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error(f"     ❌ {description} failed (exit {result.returncode})")
+        logger.error(f"     stderr: {result.stderr[:500]}")
+        if check:
+            raise RuntimeError(f"{description} failed: {result.stderr[:300]}")
+    else:
+        logger.info(f"     ✅ {description}")
     return result
 
 
-def _write_dockerfile(site_dir: Path, theme_slug: str) -> None:
-    """Write Dockerfile that bakes theme and plugins into the WordPress image (port the app as a container)."""
-    slug = (theme_slug or THEME_SLUG).strip() or THEME_SLUG
-    if "/" in slug or "\\" in slug or '"' in slug:
-        slug = THEME_SLUG
-    dockerfile = f"""# WordPress app image: theme + plugins baked in (mirror = same app in container)
-FROM wordpress:latest
-ARG THEME_SLUG=wordpress-starter
-COPY theme/ /var/www/html/wp-content/themes/${{THEME_SLUG}}/
-COPY plugins/ /var/www/html/wp-content/plugins/
-RUN chown -R www-data:www-data /var/www/html/wp-content/themes /var/www/html/wp-content/plugins
-"""
-    (site_dir / "Dockerfile").write_text(dockerfile)
-    (site_dir / ".dockerignore").write_text(
-        "docker-compose.yml\n*.sql\n.git\n.deploy-tmp\n"
-    )
+def _run_output(cmd: str) -> tuple[int, str, str]:
+    """Run a command and return (returncode, stdout, stderr)."""
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    return result.returncode, result.stdout.strip(), result.stderr.strip()
 
 
-def _allocate_port():
-    used = set()
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT port FROM wordpress_docker_sites WHERE port IS NOT NULL")
-    for (p,) in cursor.fetchall():
-        used.add(p)
-    conn.close()
-    # Get multiple candidates (not bound on host), pick first not already in DB
-    candidates = find_available_ports(PORT_START, 50)
-    for port in candidates:
-        if port not in used:
-            return port
-    raise RuntimeError(f"No available port in range starting {PORT_START} (tried {len(candidates)} ports, all in use or assigned)")
+def _wp(
+    site_name: str, wp_args: str, check: bool = True
+) -> subprocess.CompletedProcess:
+    """Run a WP-CLI command inside the WordPress container.
+
+    Uses docker exec with the --user www-data flag so WP-CLI runs as the
+    correct user and file permissions are not broken.
+    """
+    container = f"{site_name}-wordpress"
+    cmd = f"docker exec {container} wp {wp_args} --allow-root"
+    return _run(cmd, f"wp {wp_args[:60]}", check=check)
 
 
-def _generate_password(length=32):
-    import secrets
-    import string
-    return "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(length))
+def _wp_output(site_name: str, wp_args: str) -> tuple[int, str, str]:
+    """Run a WP-CLI command and capture output."""
+    container = f"{site_name}-wordpress"
+    cmd = f"docker exec {container} wp {wp_args} --allow-root"
+    return _run_output(cmd)
 
 
-def _write_compose(
-    site_dir: Path,
+def _wp_eval_file(site_name: str, php_code: str) -> str:
+    """Execute PHP code inside the WordPress container via wp eval-file.
+
+    WHY: Inline php -r fails through docker exec due to quote escaping.
+    Writing to a temp file and using wp eval-file is always reliable.
+    """
+    container = f"{site_name}-wordpress"
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".php", delete=False, prefix="hosting-"
+    ) as f:
+        f.write(php_code)
+        tmp_local = f.name
+
+    try:
+        _run(
+            f"docker cp {tmp_local} {container}:/tmp/hosting-eval.php",
+            "Copy PHP eval file to container",
+        )
+        rc, out, err = _run_output(
+            f"docker exec {container} wp eval-file /tmp/hosting-eval.php --allow-root"
+        )
+        _run_output(f"docker exec {container} rm /tmp/hosting-eval.php")
+        return out
+    finally:
+        os.unlink(tmp_local)
+
+
+def _wait_for_mysql(
+    site_name: str, db_user: str, db_password: str, db_name: str, timeout: int = 60
+) -> bool:
+    """Poll until MySQL is accepting connections inside the db container."""
+    import time
+
+    container = f"{site_name}-db"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        rc, _, _ = _run_output(
+            f"docker exec {container} "
+            f"mysqladmin ping -u '{db_user}' -p'{db_password}' --silent 2>/dev/null"
+        )
+        if rc == 0:
+            return True
+        time.sleep(2)
+    return False
+
+
+def _write_nginx_vhost(domain: str, port: int):
+    """Write and enable an Nginx vhost for a site.
+
+    The /api/ location routes back to hosting-mvp (port 5000) so
+    deployed sites can call the management API without exposing it publicly.
+    """
+    config = f"""server {{
+    listen 80;
+    server_name {domain} www.{domain};
+
+    # Route /api/ calls back to hosting-mvp on the same host
+    location /api/ {{
+        proxy_pass http://127.0.0.1:5000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }}
+
+    # Route everything else to the WordPress container
+    location / {{
+        proxy_pass http://localhost:{port};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_cache_bypass $http_upgrade;
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+        client_max_body_size 64M;
+    }}
+}}"""
+
+    available = NGINX_AVAILABLE / domain
+    enabled = NGINX_ENABLED / domain
+
+    with open("/tmp/nginx_vhost.tmp", "w") as f:
+        f.write(config)
+
+    subprocess.run(["sudo", "cp", "/tmp/nginx_vhost.tmp", str(available)], check=True)
+    os.remove("/tmp/nginx_vhost.tmp")
+    subprocess.run(["sudo", "rm", "-f", str(enabled)], check=False)
+    subprocess.run(["sudo", "ln", "-sf", str(available), str(enabled)], check=True)
+
+    test = subprocess.run(["sudo", "nginx", "-t"], capture_output=True, text=True)
+    if test.returncode == 0:
+        subprocess.run(["sudo", "systemctl", "reload", "nginx"])
+        logger.info(f"  ✅ Nginx vhost configured for {domain}")
+    else:
+        logger.error(f"  ❌ Nginx config test failed: {test.stderr}")
+        raise RuntimeError(f"Nginx config invalid: {test.stderr}")
+
+
+def _remove_nginx_vhost(domain: str):
+    """Remove and disable an Nginx vhost, reload Nginx."""
+    available = NGINX_AVAILABLE / domain
+    enabled = NGINX_ENABLED / domain
+
+    for path in [enabled, available]:
+        subprocess.run(["sudo", "rm", "-f", str(path)], check=False)
+
+    test = subprocess.run(["sudo", "nginx", "-t"], capture_output=True, text=True)
+    if test.returncode == 0:
+        subprocess.run(["sudo", "systemctl", "reload", "nginx"])
+        logger.info(f"  ✅ Nginx vhost removed for {domain}")
+    else:
+        logger.warning(f"  ⚠️  Nginx test failed after vhost removal: {test.stderr}")
+
+
+def _build_compose_file(
+    site_name: str,
     port: int,
     db_name: str,
     db_user: str,
-    db_pass: str,
-    theme_slug: str = None,
-    site_name: str = None,
-):
-    slug = (theme_slug or THEME_SLUG).strip() or THEME_SLUG
-    if "/" in slug or "\\" in slug or '"' in slug or "\n" in slug:
-        slug = THEME_SLUG
-    image_name = f"wordpress-{site_name}:latest" if site_name else "wordpress-app:latest"
-    # App is the image (Dockerfile bakes theme + plugins). WordPress container serves HTTP on 80.
-    compose = f"""services:
+    db_password: str,
+    db_root_password: str,
+    site_path: Path,
+    domain: str,
+) -> str:
+    """Generate docker-compose.yml content for a WordPress site.
+
+    Key decisions:
+    - uploads_data is a named volume so uploads persist across redeployments.
+      Themes and plugins come from the image (or bind mount); uploads must not.
+    - MySQL 8.0 with WAL-equivalent settings for reliability.
+    - healthcheck on db so WordPress only starts when MySQL is ready.
+    """
+    return f"""version: '3.8'
+
+services:
   wordpress:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        THEME_SLUG: {slug}
-    image: {image_name}
+    image: {WORDPRESS_IMAGE}
+    container_name: {site_name}-wordpress
+    restart: always
     ports:
       - "{port}:80"
     environment:
       WORDPRESS_DB_HOST: db
       WORDPRESS_DB_USER: {db_user}
-      WORDPRESS_DB_PASSWORD: {db_pass}
+      WORDPRESS_DB_PASSWORD: {db_password}
       WORDPRESS_DB_NAME: {db_name}
+      WORDPRESS_CONFIG_EXTRA: |
+        define('WP_HOME', 'http://{domain}');
+        define('WP_SITEURL', 'http://{domain}');
     volumes:
-      - wp_uploads:/var/www/html/wp-content/uploads
+      - ./wp-content:/var/www/html/wp-content
+      - uploads_data:/var/www/html/wp-content/uploads
     depends_on:
       db:
         condition: service_healthy
+    networks:
+      - internal
 
   db:
-    image: mysql:8.0
+    image: {MYSQL_IMAGE}
+    container_name: {site_name}-db
+    restart: always
     environment:
       MYSQL_DATABASE: {db_name}
       MYSQL_USER: {db_user}
-      MYSQL_PASSWORD: {db_pass}
-      MYSQL_ROOT_PASSWORD: {db_pass}
+      MYSQL_PASSWORD: {db_password}
+      MYSQL_ROOT_PASSWORD: {db_root_password}
     volumes:
       - db_data:/var/lib/mysql
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
-      interval: 5s
+      interval: 10s
       timeout: 5s
-      retries: 10
+      retries: 5
+    networks:
+      - internal
 
 volumes:
-  wp_uploads:
   db_data:
+  uploads_data:
+
+networks:
+  internal:
+    driver: bridge
 """
-    (site_dir / "docker-compose.yml").write_text(compose)
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
 
 
 def create_site(
-    site_name: str, domain: str, files: dict, theme_slug: str = None
+    site_name: str,
+    domain: str,
+    files: dict,
+    theme_slug: str | None = None,
 ) -> dict:
     """
-    Create a WordPress Docker site: write theme and plugin files, generate compose, start stack, create nginx.
-    files: dict of path -> content (paths like "theme/style.css", "plugins/.../file.php").
-    theme_slug: directory name under wp-content/themes/ (must match dev so DB option template/stylesheet is valid).
+    Provision a new WordPress Docker site.
+
+    Args:
+        site_name:  Unique identifier (derived from domain, slugified)
+        domain:     Full domain name e.g. mysite.com
+        files:      Dict of {relative_path: content} for wp-content files
+        theme_slug: Theme directory name to activate after deploy
+
+    Returns:
+        {site_name, domain, port, url, admin_url}
+
+    Raises:
+        RuntimeError on any unrecoverable step.
     """
-    site_dir = WORDPRESS_DOCKER_BASE / site_name
-    if site_dir.exists():
-        shutil.rmtree(site_dir)
-    site_dir.mkdir(parents=True, exist_ok=True)
-    theme_dir = site_dir / "theme"
-    theme_dir.mkdir(exist_ok=True)
-    plugins_dir = site_dir / "plugins"
-    plugins_dir.mkdir(exist_ok=True)
+    logger.info("=" * 55)
+    logger.info(f"  WordPress Docker — Create Site: {site_name}")
+    logger.info(f"  Domain: {domain}")
+    logger.info("=" * 55)
 
+    # ── Step 1: Allocate port ─────────────────────────────────────────────────
+    ports = find_available_ports(8000, 1)
+    if not ports:
+        raise RuntimeError("No available ports in range 8000+")
+    port = ports[0]
+    logger.info(f"  Allocated port: {port}")
+
+    # ── Step 2: Generate credentials ─────────────────────────────────────────
+    db_name = f"wp_{site_name.replace('-', '_')[:32]}"
+    db_user = f"wp_{site_name.replace('-', '_')[:16]}"
+    db_password = _generate_password()
+    db_root_password = _generate_password()
+
+    # ── Step 3: Create site directory and write files ─────────────────────────
+    site_path = WORDPRESS_BASE_DIR / site_name
+    site_path.mkdir(parents=True, exist_ok=True)
+
+    wp_content_path = site_path / "wp-content"
+    wp_content_path.mkdir(exist_ok=True)
+    (wp_content_path / "uploads").mkdir(exist_ok=True)
+
+    # Write theme/plugin files from the deploy payload
+    files_written = 0
     for rel_path, content in files.items():
-        if not rel_path.strip() or ".." in rel_path:
-            continue
-        full = site_dir / rel_path
-        full.parent.mkdir(parents=True, exist_ok=True)
-        text = content if isinstance(content, str) else str(content)
-        full.write_text(text, encoding="utf-8", errors="replace")
+        full_path = site_path / rel_path
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_text(content)
+        files_written += 1
 
-    port = _allocate_port()
-    db_name = f"wp_{site_name}".replace("-", "_")[:64]
-    db_user = db_name
-    db_pass = _generate_password()
+    logger.info(f"  Written {files_written} files to {site_path}")
 
-    resolved_slug = (theme_slug or THEME_SLUG).strip() or THEME_SLUG
-    if "/" in resolved_slug or "\\" in resolved_slug or '"' in resolved_slug or "\n" in resolved_slug:
-        resolved_slug = THEME_SLUG
-    _write_dockerfile(site_dir, resolved_slug)
-    _write_compose(site_dir, port, db_name, db_user, db_pass, theme_slug=resolved_slug, site_name=site_name)
-
-    _run(
-        ["docker", "compose", "build", "--build-arg", f"THEME_SLUG={resolved_slug}"],
-        cwd=site_dir,
-        timeout=600,
+    # ── Step 4: Write docker-compose.yml ─────────────────────────────────────
+    compose_content = _build_compose_file(
+        site_name,
+        port,
+        db_name,
+        db_user,
+        db_password,
+        db_root_password,
+        site_path,
+        domain,
     )
-    _run(["docker", "compose", "up", "-d"], cwd=site_dir, timeout=120)
-    create_nginx_reverse_proxy(domain, port)
-    reload_nginx()
+    (site_path / "docker-compose.yml").write_text(compose_content)
 
-    # Insert site record (retry on SQLite "database is locked")
-    conn = None
-    for attempt in range(5):
-        try:
-            conn = get_db()
-            cursor = conn.cursor()
-            try:
-                cursor.execute(
-                    """
-                    INSERT INTO wordpress_docker_sites (site_name, domain, port, site_path, status, db_name, db_user, db_password, theme_slug)
-                    VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?)
-                    """,
-                    (site_name, domain, port, str(site_dir), db_name, db_user, db_pass, resolved_slug),
-                )
-            except Exception as col_err:
-                if "theme_slug" in str(col_err) or "no such column" in str(col_err).lower():
-                    cursor.execute(
-                        """
-                        INSERT INTO wordpress_docker_sites (site_name, domain, port, site_path, status, db_name, db_user, db_password)
-                        VALUES (?, ?, ?, ?, 'running', ?, ?, ?)
-                        """,
-                        (site_name, domain, port, str(site_dir), db_name, db_user, db_pass),
-                    )
-                else:
-                    raise
-            conn.commit()
-            conn.close()
-            conn = None
-            break
-        except Exception as e:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                conn = None
-            if "locked" in str(e).lower() and attempt < 4:
-                time.sleep(1.0 * (attempt + 1))
-                continue
-            raise
+    # ── Step 5: Write .env for reference and script use ───────────────────────
+    env_content = f"""SITE_NAME={site_name}
+DOMAIN={domain}
+PROD_PORT={port}
+DB_NAME={db_name}
+DB_USER={db_user}
+DB_PASSWORD={db_password}
+DB_ROOT_PASSWORD={db_root_password}
+"""
+    (site_path / ".env").write_text(env_content)
+
+    # ── Step 6: Start containers ──────────────────────────────────────────────
+    _run(
+        f"cd '{site_path}' && docker compose up -d",
+        "Start WordPress and MySQL containers",
+    )
+
+    # ── Step 7: Wait for MySQL to be ready ────────────────────────────────────
+    logger.info("  Waiting for MySQL to be ready...")
+    if not _wait_for_mysql(site_name, db_user, db_password, db_name):
+        raise RuntimeError("MySQL did not become ready within 60 seconds")
+
+    # Give WordPress a moment to initialise
+    import time
+
+    time.sleep(5)
+
+    # ── Step 8: Fix uploads permissions ──────────────────────────────────────
+    # UID 33 = www-data inside the WordPress container
+    _run(
+        f"docker exec {site_name}-wordpress chown -R 33:33 /var/www/html/wp-content/uploads",
+        "Fix uploads directory ownership (www-data UID 33)",
+        check=False,
+    )
+
+    # ── Step 9: Activate theme if specified ──────────────────────────────────
+    if theme_slug:
+        _wp(site_name, f"theme activate {theme_slug}", check=False)
+
+    # ── Step 10: Configure Nginx vhost ────────────────────────────────────────
+    _write_nginx_vhost(domain, port)
+
+    # ── Step 11: Register in database ────────────────────────────────────────
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        """INSERT INTO wordpress_docker_sites
+           (site_name, domain, port, site_path, status, db_name, db_user, db_password, theme_slug)
+           VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?)""",
+        (
+            site_name,
+            domain,
+            port,
+            str(site_path),
+            db_name,
+            db_user,
+            db_password,
+            theme_slug,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    logger.info("=" * 55)
+    logger.info(f"  ✅ Site created: {domain}")
+    logger.info(f"  URL:   http://{domain}")
+    logger.info(f"  Admin: http://{domain}/wp-admin")
+    logger.info(f"  Port:  {port}")
+    logger.info("=" * 55)
 
     return {
-        "port": port,
-        "site_path": str(site_dir),
         "site_name": site_name,
+        "domain": domain,
+        "port": port,
         "url": f"http://{domain}",
         "admin_url": f"http://{domain}/wp-admin",
     }
 
 
-def delete_site(site_name: str, domain: str = None):
-    """Stop containers, remove nginx config, remove dir, delete from DB."""
-    site_dir = WORDPRESS_DOCKER_BASE / site_name
-    if not domain:
-        conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute("SELECT domain FROM wordpress_docker_sites WHERE site_name = ?", (site_name,))
-        row = cursor.fetchone()
-        conn.close()
-        domain = row[0] if row else None
-    if domain:
-        try:
-            remove_nginx_site(domain)
-            reload_nginx()
-        except Exception as e:
-            logger.warning("Remove nginx: %s", e)
-    if site_dir.exists():
-        try:
-            _run(["docker", "compose", "down", "-v"], cwd=site_dir, timeout=60)
-        except Exception as e:
-            logger.warning("Compose down: %s", e)
-        shutil.rmtree(site_dir, ignore_errors=True)
+def list_sites() -> list[dict]:
+    """Return all WordPress Docker sites with live container status."""
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM wordpress_docker_sites WHERE site_name = ?", (site_name,))
+    cursor.execute(
+        """SELECT site_name, domain, port, site_path, status, db_name, created_at
+           FROM wordpress_docker_sites ORDER BY created_at DESC"""
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    sites = []
+    for site_name, domain, port, site_path, status, db_name, created_at in rows:
+        # Check live container status
+        rc, out, _ = _run_output(
+            f"docker inspect --format='{{{{.State.Status}}}}' {site_name}-wordpress 2>/dev/null"
+        )
+        container_status = out.strip("'") if rc == 0 else "not found"
+
+        sites.append(
+            {
+                "site_name": site_name,
+                "domain": domain,
+                "port": port,
+                "site_path": site_path,
+                "db_status": status,
+                "container_status": container_status,
+                "url": f"http://{domain}",
+                "admin_url": f"http://{domain}/wp-admin",
+                "created_at": created_at,
+            }
+        )
+
+    return sites
+
+
+def delete_site(site_name: str, domain: str):
+    """
+    Fully remove a WordPress Docker site.
+
+    Steps:
+      1. Stop and remove Docker containers and volumes
+      2. Remove Nginx vhost
+      3. Delete site files from disk
+      4. Remove database record
+    """
+    logger.info(f"  Deleting WordPress site: {site_name} ({domain})")
+
+    site_path = WORDPRESS_BASE_DIR / site_name
+
+    # ── Step 1: Stop containers ───────────────────────────────────────────────
+    if site_path.exists():
+        _run(
+            f"cd '{site_path}' && docker compose down -v",
+            "Stop and remove containers and volumes",
+            check=False,
+        )
+    else:
+        # Try to stop by container name directly if compose file is missing
+        for container in [f"{site_name}-wordpress", f"{site_name}-db"]:
+            _run_output(f"docker rm -f {container} 2>/dev/null")
+
+    # ── Step 2: Remove Nginx vhost ────────────────────────────────────────────
+    _remove_nginx_vhost(domain)
+
+    # ── Step 3: Delete site files ─────────────────────────────────────────────
+    if site_path.exists():
+        shutil.rmtree(site_path)
+        logger.info(f"  ✅ Removed site directory: {site_path}")
+
+    # ── Step 4: Remove database record ───────────────────────────────────────
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM wordpress_docker_sites WHERE site_name = ?", (site_name,)
+    )
     conn.commit()
     conn.close()
 
-
-def _get_site_db_credentials(site_name: str):
-    conn = get_db()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            "SELECT site_path, db_name, db_user, db_password, theme_slug FROM wordpress_docker_sites WHERE site_name = ?",
-            (site_name,),
-        )
-    except Exception:
-        cursor.execute(
-            "SELECT site_path, db_name, db_user, db_password FROM wordpress_docker_sites WHERE site_name = ?",
-            (site_name,),
-        )
-    row = cursor.fetchone()
-    conn.close()
-    if not row or not row[0]:
-        raise ValueError(f"Site not found: {site_name}")
-    site_path, db_name, db_user, db_password = row[0], row[1], row[2], row[3]
-    theme_slug = row[4] if len(row) > 4 and row[4] else None
-    if not all((db_name, db_user, db_password)):
-        raise ValueError(f"Site {site_name} has no DB credentials (deploy may predate mirror support)")
-    return Path(site_path), db_name, db_user, db_password, theme_slug
-
-
-def _theme_slug_from_compose(site_dir: Path) -> str:
-    """Read the theme slug from the site's docker-compose.yml (what we actually mounted)."""
-    compose_path = site_dir / "docker-compose.yml"
-    if not compose_path.is_file():
-        return ""
-    try:
-        text = compose_path.read_text(encoding="utf-8")
-        # .../themes/SLUG:ro or .../themes/SLUG\n
-        m = re.search(r"/wp-content/themes/([a-zA-Z0-9_-]+)(?::ro)?\s", text)
-        return m.group(1) if m else ""
-    except Exception:
-        return ""
-
-
-def _replace_urls_in_dump_safe(content: str, source_url: str, target_url: str) -> str:
-    """
-    Replace source_url with target_url in dump. Updates PHP serialized string lengths so options (e.g. WooCommerce) stay valid.
-    """
-    if not source_url or not target_url or source_url == target_url:
-        return content
-    result = []
-    i = 0
-    while i < len(content):
-        # Look for PHP serialized string s:N:"
-        m = re.search(r"s:(\d+):\"", content[i:])
-        if not m:
-            result.append(content[i:].replace(source_url, target_url))
-            break
-        j = i + m.start()
-        result.append(content[i:j].replace(source_url, target_url))
-        orig_len = int(m.group(1))
-        payload_start = j + m.end()
-        payload_end = payload_start + orig_len
-        if payload_end + 2 > len(content):
-            result.append(content[j:].replace(source_url, target_url))
-            break
-        if content[payload_end : payload_end + 2] != '";':
-            result.append(content[j : payload_end + 2].replace(source_url, target_url))
-            i = payload_end + 2
-            continue
-        payload = content[payload_start:payload_end]
-        after = content[payload_end : payload_end + 2]
-        if source_url in payload:
-            new_payload = payload.replace(source_url, target_url)
-            new_len = len(new_payload)
-            result.append(f's:{new_len}:"')
-            result.append(new_payload)
-        else:
-            result.append(content[j:payload_end])
-        result.append(after)
-        i = payload_end + 2
-    return "".join(result)
+    logger.info(f"  ✅ Site deleted: {site_name}")
 
 
 def import_site_database(
     site_name: str,
-    dump_path: Path,
-    source_url: str = None,
-    target_url: str = None,
-    theme_slug: str = None,
-) -> None:
+    sql_path: Path,
+    source_url: str | None = None,
+    target_url: str | None = None,
+    theme_slug: str | None = None,
+):
     """
-    Import a SQL dump into the site's MySQL container.
-    If source_url and target_url are set, replace the former with the latter in the dump (serialized-safe) before importing.
-    If theme_slug is set, after import the active theme (template + stylesheet) is set to that slug so the mirrored theme is selected.
+    Import a SQL dump into an existing WordPress Docker site.
+
+    IMPORTANT — URL replacement strategy:
+    This function uses `wp search-replace` inside the WordPress container
+    for URL replacement. This is the ONLY correct approach for WordPress.
+
+    Raw string substitution on SQL files corrupts WordPress serialised PHP
+    arrays. WordPress stores many settings as PHP serialised strings with
+    byte-length prefixes. Changing the URL string changes the byte length,
+    making the prefix invalid. WordPress then silently discards the entire
+    option value and falls back to defaults. The most visible symptom is
+    the header logo disappearing after every database push.
+
+    `wp search-replace` understands WordPress serialisation and updates
+    byte-length prefixes correctly.
+
+    Args:
+        site_name:   Site identifier
+        sql_path:    Path to the .sql dump file on the host
+        source_url:  URL to replace FROM (e.g. http://localhost:8082)
+        target_url:  URL to replace TO   (e.g. http://mysite.com)
+        theme_slug:  Theme to activate after import (optional)
+
+    Raises:
+        ValueError if site_name not found in database.
+        RuntimeError on import or search-replace failure.
     """
-    site_dir, db_name, db_user, db_password, theme_slug_from_db = _get_site_db_credentials(site_name)
-    dump_path = Path(dump_path)
-    if not dump_path.is_file():
-        raise FileNotFoundError(f"Dump file not found: {dump_path}")
+    logger.info(f"  Importing database for: {site_name}")
 
-    # Resolve theme slug: client param > stored at create time > read from compose file
-    active_theme_slug = (theme_slug or theme_slug_from_db or _theme_slug_from_compose(site_dir) or "").strip() or None
-
-    import_path = dump_path
-    if source_url and target_url and source_url != target_url:
-        content = dump_path.read_text(encoding="utf-8", errors="replace")
-        content = _replace_urls_in_dump_safe(content, source_url, target_url)
-        import_path = site_dir / ".import_dump.sql"
-        import_path.write_text(content, encoding="utf-8", errors="replace")
-
-    # Use -h 127.0.0.1 so mysql client connects via TCP (socket path can differ in container)
-    try:
-        with open(import_path, "rb") as f:
-            r = subprocess.run(
-                ["docker", "compose", "exec", "-T", "db", "mysql", "-h", "127.0.0.1", f"-u{db_user}", f"-p{db_password}", db_name],
-                cwd=site_dir,
-                stdin=f,
-                capture_output=True,
-                text=False,
-                timeout=600,
-            )
-        if r.returncode != 0:
-            raise RuntimeError(r.stderr.decode("utf-8", errors="replace") if r.stderr else "Import failed")
-    except Exception:
-        if import_path != dump_path and import_path.exists():
-            import_path.unlink(missing_ok=True)
-        raise
-    if import_path != dump_path and import_path.exists():
-        import_path.unlink(missing_ok=True)
-
-    # Mark WooCommerce setup wizard as completed so mirror deploy doesn't show "setup store" again
-    _mark_woocommerce_wizard_completed(site_dir, db_name, db_user, db_password)
-
-    # Force active theme: SQL update first, then WordPress API via PHP script (reliable inside container)
-    if active_theme_slug:
-        _set_active_theme(site_dir, db_name, db_user, db_password, active_theme_slug)
-        _activate_theme_via_php(site_dir, active_theme_slug)
-        logger.info("Set active theme to %s for %s", active_theme_slug, site_name)
-
-    logger.info("Database import completed for %s", site_name)
-
-
-def _activate_theme_via_php(site_dir: Path, theme_slug: str) -> None:
-    """Run the theme's activate_theme.php inside the wordpress container so switch_theme() is used."""
-    slug = (theme_slug or "").strip()[:64]
-    if not slug or "/" in slug or "\\" in slug:
-        return
-    script_path = f"/var/www/html/wp-content/themes/{slug}/activate_theme.php"
-    try:
-        r = subprocess.run(
-            [
-                "docker",
-                "compose",
-                "exec",
-                "-T",
-                "wordpress",
-                "php",
-                script_path,
-            ],
-            cwd=site_dir,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if r.returncode != 0:
-            logger.warning(
-                "Theme PHP activation failed (non-fatal): %s",
-                r.stderr or r.stdout or "exit %s" % r.returncode,
-            )
-    except Exception as e:
-        logger.warning("Theme PHP activation failed (non-fatal): %s", e)
-
-
-def _set_active_theme(
-    site_dir: Path,
-    db_name: str,
-    db_user: str,
-    db_password: str,
-    theme_slug: str,
-    table_prefix: str = "wp_",
-) -> None:
-    """Set WordPress active theme (template and stylesheet options) so the mirrored theme is selected."""
-    slug = theme_slug.strip()[:64]
-    if not slug or "/" in slug or "\\" in slug or "'" in slug:
-        return
-    try:
-        for option_name in ("template", "stylesheet"):
-            r = subprocess.run(
-                [
-                    "docker",
-                    "compose",
-                    "exec",
-                    "-T",
-                    "db",
-                    "mysql",
-                    "-h",
-                    "127.0.0.1",
-                    f"-u{db_user}",
-                    f"-p{db_password}",
-                    db_name,
-                    "-e",
-                    f"UPDATE {table_prefix}options SET option_value = '{slug}' "
-                    f"WHERE option_name = '{option_name}';",
-                ],
-                cwd=site_dir,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if r.returncode != 0:
-                logger.warning(
-                    "Could not set option %s (non-fatal): %s",
-                    option_name,
-                    r.stderr or r.stdout,
-                )
-    except Exception as e:
-        logger.warning("Could not set active theme (non-fatal): %s", e)
-
-
-def _mark_woocommerce_wizard_completed(
-    site_dir: Path, db_name: str, db_user: str, db_password: str, table_prefix: str = "wp_"
-) -> None:
-    """Set woocommerce_onboarding_profile so the setup wizard is skipped (mirror = already set up)."""
-    # WordPress stores options as PHP-serialized; completed + skipped so wizard doesn't show
-    value = "a:2:{s:9:\"completed\";b:1;s:7:\"skipped\";b:1;}"
-    try:
-        r = subprocess.run(
-            [
-                "docker",
-                "compose",
-                "exec",
-                "-T",
-                "db",
-                "mysql",
-                "-h",
-                "127.0.0.1",
-                f"-u{db_user}",
-                f"-p{db_password}",
-                db_name,
-                "-e",
-                f"INSERT INTO {table_prefix}options (option_name, option_value, autoload) "
-                f"VALUES ('woocommerce_onboarding_profile', '{value}', 'no') "
-                f"ON DUPLICATE KEY UPDATE option_value = '{value}';",
-            ],
-            cwd=site_dir,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if r.returncode != 0:
-            logger.warning(
-                "Could not set WooCommerce wizard completed (non-fatal): %s",
-                r.stderr or r.stdout,
-            )
-    except Exception as e:
-        logger.warning("Could not set WooCommerce wizard completed (non-fatal): %s", e)
-
-
-def list_sites():
+    # ── Validate site exists ──────────────────────────────────────────────────
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT site_name, domain, port, site_path, status, created_at FROM wordpress_docker_sites ORDER BY created_at DESC"
+        "SELECT db_name, db_user, db_password FROM wordpress_docker_sites WHERE site_name = ?",
+        (site_name,),
     )
-    rows = cursor.fetchall()
+    row = cursor.fetchone()
     conn.close()
-    return [
-        {
-            "site_name": r[0],
-            "domain": r[1],
-            "port": r[2],
-            "site_path": r[3],
-            "status": r[4],
-            "created_at": r[5],
-            "url": f"http://{r[1]}" if r[1] else None,
-            "admin_url": f"http://{r[1]}/wp-admin" if r[1] else None,
-        }
-        for r in rows
-    ]
+
+    if not row:
+        raise ValueError(f"Site '{site_name}' not found")
+
+    db_name, db_user, db_password = row
+
+    # ── Step 1: Copy SQL file into the container ──────────────────────────────
+    _run(
+        f"docker cp '{sql_path}' {site_name}-db:/tmp/import.sql",
+        "Copy SQL dump to container",
+    )
+
+    # ── Step 2: Import into MySQL ─────────────────────────────────────────────
+    # Single-quote the password to handle special characters safely
+    _run(
+        f"docker exec {site_name}-db "
+        f"mysql -u '{db_user}' -p'{db_password}' {db_name} "
+        f"< /tmp/import.sql",
+        "Import SQL dump into MySQL",
+    )
+
+    # Clean up temp file
+    _run_output(f"docker exec {site_name}-db rm /tmp/import.sql")
+
+    # ── Step 3: URL replacement via wp search-replace ────────────────────────
+    # CRITICAL: Must use wp search-replace, NOT raw string replacement.
+    # See docstring above for explanation of why.
+    if source_url and target_url:
+        logger.info(f"  Replacing URLs: {source_url} → {target_url}")
+
+        rc, out, err = _run_output(
+            f"docker exec {site_name}-wordpress "
+            f"wp search-replace '{source_url}' '{target_url}' "
+            f"--all-tables --precise --allow-root"
+        )
+
+        if rc != 0:
+            raise RuntimeError(f"wp search-replace failed: {err[:300]}")
+
+        logger.info(f"  ✅ URL replacement complete")
+
+        # Log replacement counts for visibility
+        for line in out.splitlines():
+            if "replacements" in line.lower() or "Success" in line:
+                logger.info(f"     {line}")
+
+    # ── Step 4: Activate theme if specified ──────────────────────────────────
+    if theme_slug:
+        _wp(site_name, f"theme activate {theme_slug}", check=False)
+
+    # ── Step 5: Flush all caches ──────────────────────────────────────────────
+    _wp(site_name, "cache flush", check=False)
+    _wp(site_name, "elementor flush-css", check=False)
+    _wp(site_name, "rewrite flush", check=False)
+
+    logger.info(f"  ✅ Database import complete for {site_name}")
+
+
+def set_theme_option(site_name: str, option_key: str, option_value: dict):
+    """
+    Set a WordPress theme option directly via wp eval-file.
+
+    WHY: wp option update serialises simple values but struggles with nested
+    arrays (theme options, logo arrays, Redux settings). Writing PHP directly
+    via eval-file is the only reliable method for complex option structures.
+
+    Example:
+        set_theme_option("mysite-com", "header_logo", {
+            "url": "http://mysite.com/wp-content/uploads/logo.png",
+            "width": "175",
+            "height": "60",
+        })
+    """
+    # Build PHP array from dict
+    php_array_items = []
+    for k, v in option_value.items():
+        escaped = str(v).replace("'", "\\'")
+        php_array_items.append(f"    '{k}' => '{escaped}'")
+    php_array = "array(\n" + ",\n".join(php_array_items) + "\n)"
+
+    php = f"""<?php
+$options = get_option('{option_key}');
+if (!is_array($options)) {{
+    $options = array();
+}}
+$options = array_merge($options, {php_array});
+update_option('{option_key}', $options);
+echo 'Option updated: {option_key}' . PHP_EOL;
+"""
+    result = _wp_eval_file(site_name, php)
+    logger.info(f"  {result}")
+    return result
+
+
+def sync_uploads(site_name: str, uploads_source: Path):
+    """
+    Sync a local uploads directory into the running container's uploads volume.
+
+    Used after the initial site creation to seed the uploads volume with
+    existing media. After the first sync, new uploads made through WP Admin
+    go directly into the persistent volume and do not need resyncing.
+
+    Args:
+        site_name:       Site identifier
+        uploads_source:  Local path to the wp-content/uploads directory
+    """
+    if not uploads_source.exists():
+        logger.warning(f"  ⚠️  Uploads source not found: {uploads_source}")
+        return
+
+    logger.info(f"  Syncing uploads from {uploads_source}")
+
+    # Copy into container — docker cp handles directories recursively
+    _run(
+        f"docker cp '{uploads_source}/.' "
+        f"{site_name}-wordpress:/var/www/html/wp-content/uploads/",
+        "Sync uploads into container",
+    )
+
+    # Fix ownership after copy
+    _run(
+        f"docker exec {site_name}-wordpress "
+        f"chown -R 33:33 /var/www/html/wp-content/uploads",
+        "Fix uploads ownership after sync",
+        check=False,
+    )
+
+    logger.info(f"  ✅ Uploads synced for {site_name}")
