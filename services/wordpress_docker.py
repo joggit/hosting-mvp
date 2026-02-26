@@ -31,6 +31,7 @@ import string
 import subprocess
 import logging
 import tempfile
+import time
 from pathlib import Path
 from services.database import get_db
 from services.port_checker import find_available_ports
@@ -73,7 +74,7 @@ def _run(cmd: str, description: str, check: bool = True) -> subprocess.Completed
     return result
 
 
-def _run_output(cmd: str) -> tuple[int, str, str]:
+def _run_output(cmd: str) -> tuple:
     """Run a command and return (returncode, stdout, stderr)."""
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     return result.returncode, result.stdout.strip(), result.stderr.strip()
@@ -82,17 +83,13 @@ def _run_output(cmd: str) -> tuple[int, str, str]:
 def _wp(
     site_name: str, wp_args: str, check: bool = True
 ) -> subprocess.CompletedProcess:
-    """Run a WP-CLI command inside the WordPress container.
-
-    Uses docker exec with the --user www-data flag so WP-CLI runs as the
-    correct user and file permissions are not broken.
-    """
+    """Run a WP-CLI command inside the WordPress container."""
     container = f"{site_name}-wordpress"
     cmd = f"docker exec {container} wp {wp_args} --allow-root"
     return _run(cmd, f"wp {wp_args[:60]}", check=check)
 
 
-def _wp_output(site_name: str, wp_args: str) -> tuple[int, str, str]:
+def _wp_output(site_name: str, wp_args: str) -> tuple:
     """Run a WP-CLI command and capture output."""
     container = f"{site_name}-wordpress"
     cmd = f"docker exec {container} wp {wp_args} --allow-root"
@@ -131,8 +128,6 @@ def _wait_for_mysql(
     site_name: str, db_user: str, db_password: str, db_name: str, timeout: int = 60
 ) -> bool:
     """Poll until MySQL is accepting connections inside the db container."""
-    import time
-
     container = f"{site_name}-db"
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -146,17 +141,38 @@ def _wait_for_mysql(
     return False
 
 
-def _write_nginx_vhost(domain: str, port: int):
-    """Write and enable an Nginx vhost for a site.
-
-    The /api/ location routes back to hosting-mvp (port 5000) so
-    deployed sites can call the management API without exposing it publicly.
+def _wait_for_mysql_after_import(
+    site_name: str, db_user: str, db_password: str, db_name: str, timeout: int = 60
+) -> bool:
     """
+    Poll until MySQL accepts a real query after a large import.
+
+    Uses SELECT 1 rather than mysqladmin ping — ping succeeds even when
+    MySQL is still flushing/locking after a large import. A SELECT 1 on
+    the actual database confirms WordPress can connect and query.
+    """
+    container = f"{site_name}-db"
+    logger.info("  Waiting for MySQL to be ready after import...")
+    for attempt in range(timeout // 5):
+        rc = subprocess.run(
+            f"docker exec {container} "
+            f"mysql -u '{db_user}' -p'{db_password}' {db_name} -e 'SELECT 1'",
+            shell=True,
+            capture_output=True,
+        ).returncode
+        if rc == 0:
+            logger.info(f"  MySQL ready after ~{(attempt + 1) * 5}s")
+            return True
+        time.sleep(5)
+    return False
+
+
+def _write_nginx_vhost(domain: str, port: int):
+    """Write and enable an Nginx vhost for a site."""
     config = f"""server {{
     listen 80;
     server_name {domain} www.{domain};
 
-    # Route /api/ calls back to hosting-mvp on the same host
     location /api/ {{
         proxy_pass http://127.0.0.1:5000;
         proxy_http_version 1.1;
@@ -166,7 +182,6 @@ def _write_nginx_vhost(domain: str, port: int):
         proxy_set_header X-Forwarded-Proto $scheme;
     }}
 
-    # Route everything else to the WordPress container
     location / {{
         proxy_pass http://localhost:{port};
         proxy_http_version 1.1;
@@ -230,14 +245,7 @@ def _build_compose_file(
     site_path: Path,
     domain: str,
 ) -> str:
-    """Generate docker-compose.yml content for a WordPress site.
-
-    Key decisions:
-    - uploads_data is a named volume so uploads persist across redeployments.
-      Themes and plugins come from the image (or bind mount); uploads must not.
-    - MySQL 8.0 with WAL-equivalent settings for reliability.
-    - healthcheck on db so WordPress only starts when MySQL is ready.
-    """
+    """Generate docker-compose.yml content for a WordPress site."""
     return f"""version: '3.8'
 
 services:
@@ -313,9 +321,6 @@ def create_site(
 
     Returns:
         {site_name, domain, port, url, admin_url}
-
-    Raises:
-        RuntimeError on any unrecoverable step.
     """
     logger.info("=" * 55)
     logger.info(f"  WordPress Docker — Create Site: {site_name}")
@@ -343,7 +348,6 @@ def create_site(
     wp_content_path.mkdir(exist_ok=True)
     (wp_content_path / "uploads").mkdir(exist_ok=True)
 
-    # Write theme/plugin files from the deploy payload
     files_written = 0
     for rel_path, content in files.items():
         full_path = site_path / rel_path
@@ -366,16 +370,16 @@ def create_site(
     )
     (site_path / "docker-compose.yml").write_text(compose_content)
 
-    # ── Step 5: Write .env for reference and script use ───────────────────────
-    env_content = f"""SITE_NAME={site_name}
-DOMAIN={domain}
-PROD_PORT={port}
-DB_NAME={db_name}
-DB_USER={db_user}
-DB_PASSWORD={db_password}
-DB_ROOT_PASSWORD={db_root_password}
-"""
-    (site_path / ".env").write_text(env_content)
+    # ── Step 5: Write .env ────────────────────────────────────────────────────
+    (site_path / ".env").write_text(
+        f"SITE_NAME={site_name}\n"
+        f"DOMAIN={domain}\n"
+        f"PROD_PORT={port}\n"
+        f"DB_NAME={db_name}\n"
+        f"DB_USER={db_user}\n"
+        f"DB_PASSWORD={db_password}\n"
+        f"DB_ROOT_PASSWORD={db_root_password}\n"
+    )
 
     # ── Step 6: Start containers ──────────────────────────────────────────────
     _run(
@@ -383,29 +387,25 @@ DB_ROOT_PASSWORD={db_root_password}
         "Start WordPress and MySQL containers",
     )
 
-    # ── Step 7: Wait for MySQL to be ready ────────────────────────────────────
+    # ── Step 7: Wait for MySQL ────────────────────────────────────────────────
     logger.info("  Waiting for MySQL to be ready...")
     if not _wait_for_mysql(site_name, db_user, db_password, db_name):
         raise RuntimeError("MySQL did not become ready within 60 seconds")
 
-    # Give WordPress a moment to initialise
-    import time
-
     time.sleep(5)
 
     # ── Step 8: Fix uploads permissions ──────────────────────────────────────
-    # UID 33 = www-data inside the WordPress container
     _run(
         f"docker exec {site_name}-wordpress chown -R 33:33 /var/www/html/wp-content/uploads",
         "Fix uploads directory ownership (www-data UID 33)",
         check=False,
     )
 
-    # ── Step 9: Activate theme if specified ──────────────────────────────────
+    # ── Step 9: Activate theme ────────────────────────────────────────────────
     if theme_slug:
         _wp(site_name, f"theme activate {theme_slug}", check=False)
 
-    # ── Step 10: Configure Nginx vhost ────────────────────────────────────────
+    # ── Step 10: Configure Nginx ──────────────────────────────────────────────
     _write_nginx_vhost(domain, port)
 
     # ── Step 11: Register in database ────────────────────────────────────────
@@ -445,7 +445,7 @@ DB_ROOT_PASSWORD={db_root_password}
     }
 
 
-def list_sites() -> list[dict]:
+def list_sites() -> list:
     """Return all WordPress Docker sites with live container status."""
     conn = get_db()
     cursor = conn.cursor()
@@ -458,12 +458,10 @@ def list_sites() -> list[dict]:
 
     sites = []
     for site_name, domain, port, site_path, status, db_name, created_at in rows:
-        # Check live container status
         rc, out, _ = _run_output(
             f"docker inspect --format='{{{{.State.Status}}}}' {site_name}-wordpress 2>/dev/null"
         )
         container_status = out.strip("'") if rc == 0 else "not found"
-
         sites.append(
             {
                 "site_name": site_name,
@@ -503,7 +501,6 @@ def delete_site(site_name: str, domain: str):
             check=False,
         )
     else:
-        # Try to stop by container name directly if compose file is missing
         for container in [f"{site_name}-wordpress", f"{site_name}-db"]:
             _run_output(f"docker rm -f {container} 2>/dev/null")
 
@@ -575,37 +572,34 @@ def import_site_database(
     conn.close()
 
     if not row:
-        raise ValueError(f"Site '{site_name}' not found")
+        raise ValueError(f"Site not found: {site_name}")
 
     db_name, db_user, db_password = row
 
-    # ── Step 1: Copy SQL file into the container ──────────────────────────────
+    # ── Step 1: Copy SQL file into the db container ───────────────────────────
     _run(
         f"docker cp '{sql_path}' {site_name}-db:/tmp/import.sql",
         "Copy SQL dump to container",
     )
 
-    # ── Step 2: Import into MySQL ─────────────────────────────────────────────────
-    # IMPORTANT: wrap in sh -c so the redirect runs inside the container.
-    # Without sh -c, `< /tmp/import.sql` is interpreted by the HOST shell
-    # which has no such file — the container copy is invisible to it.
+    # ── Step 2: Import into MySQL ─────────────────────────────────────────────
+    # Wrap in sh -c so the redirect < runs inside the container.
+    # Without sh -c, the host shell interprets < and finds no such file.
     _run(
         f"docker exec {site_name}-db "
         f"sh -c \"mysql -u '{db_user}' -p'{db_password}' {db_name} < /tmp/import.sql\"",
         "Import SQL dump into MySQL",
     )
 
-    # Wait for MySQL to finish flushing after the large import before wp-cli connects.
-    # wp search-replace bootstraps WordPress which needs a live DB connection —
-    # connecting immediately after a 9MB import causes "Error establishing a database
-    # connection" because MySQL is still writing/locking internally.
-    logger.info("  Waiting for MySQL to settle after import...")
-    import time
+    # ── Step 2a: Wait for MySQL to settle after large import ──────────────────
+    # mysqladmin ping succeeds even while MySQL is still flushing after a large
+    # import. We probe with SELECT 1 on the actual database — the same query
+    # WordPress will run — to confirm wp-cli can connect before we proceed.
+    if not _wait_for_mysql_after_import(site_name, db_user, db_password, db_name):
+        raise RuntimeError("MySQL did not become ready within 60 seconds after import")
 
-    time.sleep(10)
-
-    # Clean up temp file
-    _run_output(f"docker exec {site_name}-db rm /tmp/import.sql")
+    # Clean up the temp SQL file from the container
+    _run_output(f"docker exec {site_name}-db rm -f /tmp/import.sql")
 
     # ── Step 3: URL replacement via wp search-replace ────────────────────────
     # CRITICAL: Must use wp search-replace, NOT raw string replacement.
@@ -622,14 +616,12 @@ def import_site_database(
         if rc != 0:
             raise RuntimeError(f"wp search-replace failed: {err[:300]}")
 
-        logger.info(f"  ✅ URL replacement complete")
-
-        # Log replacement counts for visibility
+        logger.info("  ✅ URL replacement complete")
         for line in out.splitlines():
-            if "replacements" in line.lower() or "Success" in line:
+            if "replacement" in line.lower() or "success" in line.lower():
                 logger.info(f"     {line}")
 
-    # ── Step 4: Activate theme if specified ──────────────────────────────────
+    # ── Step 4: Activate theme ────────────────────────────────────────────────
     if theme_slug:
         _wp(site_name, f"theme activate {theme_slug}", check=False)
 
@@ -650,13 +642,14 @@ def set_theme_option(site_name: str, option_key: str, option_value: dict):
     via eval-file is the only reliable method for complex option structures.
 
     Example:
-        set_theme_option("mysite-com", "header_logo", {
-            "url": "http://mysite.com/wp-content/uploads/logo.png",
-            "width": "175",
-            "height": "60",
+        set_theme_option("mysite-com", "donatm_theme_options", {
+            "header_logo": {
+                "url": "http://mysite.com/wp-content/uploads/logo.png",
+                "width": "175",
+                "height": "60",
+            }
         })
     """
-    # Build PHP array from dict
     php_array_items = []
     for k, v in option_value.items():
         escaped = str(v).replace("'", "\\'")
@@ -681,9 +674,9 @@ def sync_uploads(site_name: str, uploads_source: Path):
     """
     Sync a local uploads directory into the running container's uploads volume.
 
-    Used after the initial site creation to seed the uploads volume with
-    existing media. After the first sync, new uploads made through WP Admin
-    go directly into the persistent volume and do not need resyncing.
+    Used after initial site creation to seed the uploads volume with existing
+    media. After the first sync, new uploads made through WP Admin go directly
+    into the persistent volume and do not need resyncing.
 
     Args:
         site_name:       Site identifier
@@ -695,14 +688,12 @@ def sync_uploads(site_name: str, uploads_source: Path):
 
     logger.info(f"  Syncing uploads from {uploads_source}")
 
-    # Copy into container — docker cp handles directories recursively
     _run(
         f"docker cp '{uploads_source}/.' "
         f"{site_name}-wordpress:/var/www/html/wp-content/uploads/",
         "Sync uploads into container",
     )
 
-    # Fix ownership after copy
     _run(
         f"docker exec {site_name}-wordpress "
         f"chown -R 33:33 /var/www/html/wp-content/uploads",
