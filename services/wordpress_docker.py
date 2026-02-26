@@ -585,12 +585,13 @@ def import_site_database(
         "Copy SQL dump to container",
     )
 
-    # ── Step 2: Import into MySQL ─────────────────────────────────────────────
-    # Single-quote the password to handle special characters safely
+    # ── Step 2: Import into MySQL ─────────────────────────────────────────────────
+    # IMPORTANT: wrap in sh -c so the redirect runs inside the container.
+    # Without sh -c, `< /tmp/import.sql` is interpreted by the HOST shell
+    # which has no such file — the container copy is invisible to it.
     _run(
         f"docker exec {site_name}-db "
-        f"mysql -u '{db_user}' -p'{db_password}' {db_name} "
-        f"< /tmp/import.sql",
+        f"sh -c \"mysql -u '{db_user}' -p'{db_password}' {db_name} < /tmp/import.sql\"",
         "Import SQL dump into MySQL",
     )
 
