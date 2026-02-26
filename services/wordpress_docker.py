@@ -595,6 +595,15 @@ def import_site_database(
         "Import SQL dump into MySQL",
     )
 
+    # Wait for MySQL to finish flushing after the large import before wp-cli connects.
+    # wp search-replace bootstraps WordPress which needs a live DB connection —
+    # connecting immediately after a 9MB import causes "Error establishing a database
+    # connection" because MySQL is still writing/locking internally.
+    logger.info("  Waiting for MySQL to settle after import...")
+    import time
+
+    time.sleep(10)
+
     # Clean up temp file
     _run_output(f"docker exec {site_name}-db rm /tmp/import.sql")
 
