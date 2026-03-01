@@ -863,42 +863,54 @@ networks:
     )
 
     # ── Write nginx vhost ─────────────────────────────────────────────────────
-    _write_nginx_vhost(domain, port)
+    # Non-fatal — log and continue if nginx write fails.
+    # The site is running; nginx can be fixed without restarting containers.
+    try:
+        _write_nginx_vhost(domain, port)
+        logger.info("  ✅ Nginx vhost written")
+    except Exception as e:
+        logger.warning(f"  ⚠️  Nginx vhost write failed (non-fatal): {e}")
 
     # ── Register in SQLite ────────────────────────────────────────────────────
-    conn = get_db()
-    cursor = conn.cursor()
+    # Non-fatal — containers are running regardless of DB write success.
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
 
-    # Remove stale records for this site_name or domain if they exist
-    cursor.execute(
-        "DELETE FROM wordpress_docker_sites WHERE site_name = ? OR domain = ?",
-        (site_name, domain),
-    )
-    cursor.execute(
-        "DELETE FROM domains WHERE domain_name = ? OR app_name = ?", (domain, site_name)
-    )
+        # Remove stale records for this site_name or domain if they exist
+        cursor.execute(
+            "DELETE FROM wordpress_docker_sites WHERE site_name = ? OR domain = ?",
+            (site_name, domain),
+        )
+        cursor.execute(
+            "DELETE FROM domains WHERE domain_name = ? OR app_name = ?",
+            (domain, site_name),
+        )
 
-    cursor.execute(
-        """INSERT INTO wordpress_docker_sites
-           (site_name, domain, port, site_path, status, db_name, db_user, db_password)
-           VALUES (?, ?, ?, ?, 'running', ?, ?, ?)""",
-        (site_name, domain, port, str(site_path), db_name, db_user, db_password),
-    )
-    cursor.execute(
-        "INSERT INTO domains (domain_name, port, app_name, status) VALUES (?,?,?,'active')",
-        (domain, port, site_name),
-    )
-    cursor.execute(
-        "INSERT INTO deployment_logs (domain_name, action, status, message) VALUES (?,?,?,?)",
-        (
-            domain,
-            "register_site",
-            "success",
-            f"Site registered via Docker Hub image: {image}",
-        ),
-    )
-    conn.commit()
-    conn.close()
+        cursor.execute(
+            """INSERT INTO wordpress_docker_sites
+               (site_name, domain, port, site_path, status, db_name, db_user, db_password)
+               VALUES (?, ?, ?, ?, 'running', ?, ?, ?)""",
+            (site_name, domain, port, str(site_path), db_name, db_user, db_password),
+        )
+        cursor.execute(
+            "INSERT INTO domains (domain_name, port, app_name, status) VALUES (?,?,?,'active')",
+            (domain, port, site_name),
+        )
+        cursor.execute(
+            "INSERT INTO deployment_logs (domain_name, action, status, message) VALUES (?,?,?,?)",
+            (
+                domain,
+                "register_site",
+                "success",
+                f"Site registered via Docker Hub image: {image}",
+            ),
+        )
+        conn.commit()
+        conn.close()
+        logger.info("  ✅ SQLite records written")
+    except Exception as e:
+        logger.warning(f"  ⚠️  SQLite write failed (non-fatal): {e}")
 
     logger.info("=" * 55)
     logger.info(f"  ✅ Site registered: http://{domain}")
