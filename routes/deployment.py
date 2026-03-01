@@ -157,7 +157,7 @@ def register_routes(app):
                     scripts.setdefault("build", "next build")
                     scripts.setdefault("start", "next start")
                     project_files["package.json"] = json.dumps(package_data, indent=2)
-                except json.JSONDecodeError as e:
+                except json.JSONDecodeError:
                     return (
                         jsonify(
                             {"success": False, "error": "Invalid package.json format"}
@@ -457,14 +457,11 @@ module.exports = nextConfig;"""
             traceback.print_exc()
             return jsonify({"success": False, "error": str(e)}), 500
 
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # ADD to routes/deployment.py inside register_routes(app)
-    # ═══════════════════════════════════════════════════════════════════════════════
-    #
-    # Add this BEFORE the existing POST /api/deploy/wordpress route so Flask matches
-    # /register first (more specific path).
-    # ───────────────────────────────────────────────────────────────────────────────
-
+    # ============================================================
+    # POST: Register WordPress site via Docker Hub image
+    # Must be defined BEFORE /api/deploy/wordpress POST so Flask
+    # matches the more specific /register path first.
+    # ============================================================
     @app.route("/api/deploy/wordpress/register", methods=["POST"])
     def register_wordpress_site():
         """
@@ -478,12 +475,11 @@ module.exports = nextConfig;"""
           site_name           — site identifier (container prefix)
           domain              — production domain
           port                — production container port
-          db_name             — MySQL database name
-          db_user             — MySQL user
-          db_password         — MySQL password
-          db_root_password    — MySQL root password (optional — auto-generated if omitted)
-          dockerhub_username  — Docker Hub account (optional, default: dockster1)
-          compose_content     — docker-compose.prod.yml content (optional — auto-generated if omitted)
+          db_name             — MySQL database name (default: wordpress)
+          db_user             — MySQL user (default: wpuser)
+          db_password         — MySQL password (required)
+          db_root_password    — MySQL root password (auto-generated if omitted)
+          dockerhub_username  — Docker Hub account (default: dockster1)
         """
         try:
             data = request.get_json(force=True) or {}
@@ -496,9 +492,7 @@ module.exports = nextConfig;"""
             db_password = (data.get("db_password") or "").strip()
             db_root_password = (data.get("db_root_password") or "").strip()
             dockerhub = (data.get("dockerhub_username") or "dockster1").strip()
-            compose_content = data.get("compose_content")  # optional
 
-            # Validate required fields
             missing = [
                 f
                 for f, v in [
@@ -528,7 +522,6 @@ module.exports = nextConfig;"""
                     400,
                 )
 
-            # Auto-generate root password if not provided
             if not db_root_password:
                 import secrets, string
 
@@ -546,115 +539,6 @@ module.exports = nextConfig;"""
                 db_password=db_password,
                 db_root_password=db_root_password,
                 dockerhub_username=dockerhub,
-                compose_content=compose_content,
-            )
-
-            return jsonify(
-                {
-                    "success": True,
-                    "message": f"Site registered: {domain}",
-                    "site_name": result["site_name"],
-                    "domain": result["domain"],
-                    "port": result["port"],
-                    "url": result["url"],
-                    "admin_url": result["admin_url"],
-                }
-            )
-
-        except Exception as e:
-            app.logger.exception("Site registration failed")
-            return jsonify({"success": False, "error": str(e)}), 500
-
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # ADD to routes/deployment.py inside register_routes(app)
-    # ═══════════════════════════════════════════════════════════════════════════════
-    #
-    # Add this BEFORE the existing POST /api/deploy/wordpress route so Flask matches
-    # /register first (more specific path).
-    # ───────────────────────────────────────────────────────────────────────────────
-
-    @app.route("/api/deploy/wordpress/register", methods=["POST"])
-    def register_wordpress_site():
-        """
-        Register a new WordPress site deployed via Docker Hub image.
-
-        Unlike POST /api/deploy/wordpress (which requires theme file uploads),
-        this endpoint sets up the full server-side infrastructure using an image
-        that already exists on Docker Hub.
-
-        JSON body:
-          site_name           — site identifier (container prefix)
-          domain              — production domain
-          port                — production container port
-          db_name             — MySQL database name
-          db_user             — MySQL user
-          db_password         — MySQL password
-          db_root_password    — MySQL root password (optional — auto-generated if omitted)
-          dockerhub_username  — Docker Hub account (optional, default: dockster1)
-          compose_content     — docker-compose.prod.yml content (optional — auto-generated if omitted)
-        """
-        try:
-            data = request.get_json(force=True) or {}
-
-            site_name = (data.get("site_name") or "").strip()
-            domain = (data.get("domain") or "").strip().lower()
-            port = data.get("port")
-            db_name = (data.get("db_name") or "wordpress").strip()
-            db_user = (data.get("db_user") or "wpuser").strip()
-            db_password = (data.get("db_password") or "").strip()
-            db_root_password = (data.get("db_root_password") or "").strip()
-            dockerhub = (data.get("dockerhub_username") or "dockster1").strip()
-            compose_content = data.get("compose_content")  # optional
-
-            # Validate required fields
-            missing = [
-                f
-                for f, v in [
-                    ("site_name", site_name),
-                    ("domain", domain),
-                    ("port", port),
-                    ("db_password", db_password),
-                ]
-                if not v
-            ]
-            if missing:
-                return (
-                    jsonify(
-                        {
-                            "success": False,
-                            "error": f"Missing required fields: {', '.join(missing)}",
-                        }
-                    ),
-                    400,
-                )
-
-            try:
-                port = int(port)
-            except (TypeError, ValueError):
-                return (
-                    jsonify({"success": False, "error": "port must be an integer"}),
-                    400,
-                )
-
-            # Auto-generate root password if not provided
-            if not db_root_password:
-                import secrets, string
-
-                chars = string.ascii_letters + string.digits + "@#%^*-_=+."
-                db_root_password = "".join(secrets.choice(chars) for _ in range(32))
-
-            from services.wordpress_docker import register_site
-
-            result = register_site(
-                site_name=site_name,
-                domain=domain,
-                port=port,
-                db_name=db_name,
-                db_user=db_user,
-                db_password=db_password,
-                db_root_password=db_root_password,
-                dockerhub_username=dockerhub,
-                compose_content=compose_content,
             )
 
             return jsonify(
@@ -674,7 +558,7 @@ module.exports = nextConfig;"""
             return jsonify({"success": False, "error": str(e)}), 500
 
     # ============================================================
-    # POST: Deploy WordPress (Docker)
+    # POST: Deploy WordPress (Docker) — legacy file-upload flow
     # ============================================================
     @app.route("/api/deploy/wordpress", methods=["POST"])
     def deploy_wordpress():
@@ -868,13 +752,6 @@ module.exports = nextConfig;"""
           target_domain        — Alternative to target_url — domain only
           theme_slug           — Theme to activate after import
           post_deploy_options  — JSON string of theme options to rewrite after import
-                                 via wp eval-file. Handles nested Redux option arrays
-                                 that wp search-replace may miss.
-                                 Example:
-                                   '{"donatm_theme_options": {"header_logo": {"url": "..."}}}'
-
-        URL replacement uses wp search-replace inside the container — the only
-        correct approach for WordPress serialised PHP arrays.
         """
         try:
             if "dump" not in request.files:
