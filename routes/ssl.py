@@ -65,7 +65,7 @@ def register_routes(app):
 
         # ── Run Certbot ───────────────────────────────────────────
         cmd = [
-            "certbot", "--nginx",
+            "sudo", "certbot", "--nginx",
             "-d", domain,
             "--non-interactive",
             "--agree-tos",
