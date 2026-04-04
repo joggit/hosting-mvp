@@ -55,7 +55,7 @@ def register_routes(app):
                 "error": f"Domain {domain} not found. Deploy the site first."
             }), 404
 
-        if row["ssl_enabled"]:
+        if row[1]:  # ssl_enabled
             return jsonify({
                 "success": True,
                 "message": f"SSL already enabled for {domain}",
@@ -143,7 +143,7 @@ def register_routes(app):
         return jsonify({
             "success": True,
             "domain": domain,
-            "ssl_enabled": bool(row["ssl_enabled"]),
-            "url": f"https://{domain}" if row["ssl_enabled"] else f"http://{domain}",
-            "status": row["status"],
+            "ssl_enabled": bool(row[1]),
+            "url": f"https://{domain}" if row[1] else f"http://{domain}",
+            "status": row[2],
         })
