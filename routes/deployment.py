@@ -335,6 +335,8 @@ module.exports = nextConfig;"""
     listen 80;
     server_name {domain} www.{domain};
 
+    client_max_body_size 20m;
+
     location / {{
         proxy_pass http://localhost:{allocated_port};
         proxy_http_version 1.1;
